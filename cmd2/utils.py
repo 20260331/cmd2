@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import (
     Callable,
@@ -17,6 +18,7 @@ from collections.abc import (
 )
 from difflib import SequenceMatcher
 from typing import (
+    IO,
     TYPE_CHECKING,
     Any,
     TextIO,
@@ -414,6 +416,17 @@ class StdSim:
     """Class to simulate behavior of sys.stdout or sys.stderr.
 
     Stores contents in internal buffer and optionally echos to the inner stream it is simulating.
+
+    A byte budget can be enforced with ``max_bytes``. Once the buffer holds the budget's worth of
+    bytes, only the beginning of the output stays in memory and any further bytes are either:
+
+    * streamed to a spill file inside ``spill_dir`` (the file contains the complete output,
+      beginning included), or
+    * when ``spill_dir`` is None, returned as overflow so the caller can pass them through to the
+      original target stream.
+
+    When this StdSim wraps another StdSim (nested captures), pass-through reaches the outer
+    StdSim and is accounted against its own budget and echo settings.
     """
 
     def __init__(
@@ -423,6 +436,9 @@ class StdSim:
         echo: bool = False,
         encoding: str = "utf-8",
         errors: str = "replace",
+        max_bytes: int | None = None,
+        spill_dir: str | os.PathLike[str] | None = None,
+        spill_prefix: str = "cmd2-capture-",
     ) -> None:
         """StdSim Initializer.
 
@@ -430,13 +446,43 @@ class StdSim:
         :param echo: if True, then all input will be echoed to inner_stream
         :param encoding: codec for encoding/decoding strings (defaults to utf-8)
         :param errors: how to handle encoding/decoding errors (defaults to replace)
+        :param max_bytes: maximum number of bytes to retain in the buffer. Once exceeded, the
+                          buffer is frozen at the beginning of the output and later bytes overflow.
+                          None (the default) keeps the unbounded behavior.
+        :param spill_dir: directory in which to stream the complete output once max_bytes is
+                          exceeded. The spill file is created lazily in this directory and
+                          contains the retained prefix followed by every overflow byte. None (the
+                          default) instead leaves overflow handling to the caller.
+        :param spill_prefix: prefix for the name of a spill file created inside spill_dir.
+        :raises ValueError: if max_bytes is negative
         """
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+
         self.inner_stream = inner_stream
         self.echo = echo
         self.encoding = encoding
         self.errors = errors
         self.pause_storage = False
         self.buffer = ByteBuf(self)
+
+        # Byte budget and overflow configuration
+        self.max_bytes = max_bytes
+        self._spill_dir: str | None = None if spill_dir is None else os.fspath(spill_dir)
+        self._spill_prefix = spill_prefix
+
+        # True once the buffer has reached max_bytes. The prefix stays frozen in the buffer.
+        self.truncated = False
+
+        # Total bytes offered for storage (bytes written while pause_storage was False)
+        self.total_bytes = 0
+
+        # Lazily opened spill file that holds the complete output after truncation
+        self._spill_file: IO[bytes] | None = None
+        self.spill_path: str | None = None
+
+        # Serializes buffer/spill updates, since pipe reader threads write through ByteBuf
+        self._capture_lock = threading.Lock()
 
     def write(self, s: str) -> None:
         """Add str to internal bytes buffer and if echo is True, echo contents to inner stream.
@@ -446,10 +492,82 @@ class StdSim:
         if not isinstance(s, str):
             raise TypeError(f"write() argument must be str, not {type(s)}")
 
+        overflow: bytes | None = None
         if not self.pause_storage:
-            self.buffer.byte_buf += s.encode(encoding=self.encoding, errors=self.errors)
+            overflow = self._capture(s.encode(encoding=self.encoding, errors=self.errors))
         if self.echo:
             self.inner_stream.write(s)
+        elif overflow is not None:
+            # Budget exceeded without a spill file; continue the overflow at its original target.
+            self._write_inner_bytes(overflow)
+
+    def _capture(self, data: bytes) -> bytes | None:
+        """Store data within the byte budget and stream any overflow to a spill file.
+
+        :param data: encoded bytes offered for storage
+        :return: the bytes that did not fit and were not spilled (for pass-through), or None
+        """
+        if self.max_bytes is None:
+            with self._capture_lock:
+                self.buffer.byte_buf += data
+            return None
+
+        with self._capture_lock:
+            self.total_bytes += len(data)
+
+            # Once truncation began, the prefix stays frozen in the buffer.
+            room = 0 if self.truncated else self.max_bytes - len(self.buffer.byte_buf)
+            if room >= len(data):
+                self.buffer.byte_buf += data
+                return None
+
+            self.truncated = True
+            if room > 0:
+                self.buffer.byte_buf += data[:room]
+            overflow = data[room:]
+
+            if self._spill_dir is not None:
+                self._spill_locked(self._spill_dir, overflow)
+                return None
+            return overflow
+
+    def _spill_locked(self, spill_dir: str, overflow: bytes) -> None:
+        """Write overflow to the spill file, creating it with the retained prefix first.
+
+        The caller must hold _capture_lock.
+        """
+        if self._spill_file is None:
+            os.makedirs(spill_dir, exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix=self._spill_prefix, suffix=".log", dir=spill_dir)
+            self._spill_file = os.fdopen(fd, mode="wb")
+            self.spill_path = path
+            # The file is the complete log, so start it with the prefix held in memory.
+            self._spill_file.write(bytes(self.buffer.byte_buf))
+
+        self._spill_file.write(overflow)
+        self._spill_file.flush()
+
+    def _write_inner_bytes(self, data: bytes) -> None:
+        """Write bytes directly to the inner stream, flushing like the echo path of ByteBuf."""
+        inner_buffer = getattr(self.inner_stream, "buffer", None)
+        if inner_buffer is not None:
+            inner_buffer.write(data)
+        else:
+            self.inner_stream.write(data.decode(encoding=self.encoding, errors=self.errors))
+
+        # Flush after a newline when line buffering is on, matching ByteBuf's echo behavior, so
+        # pass-through output stays visible instead of waiting for the stream buffer to drain.
+        if self.line_buffering and any(newline in data for newline in ByteBuf.NEWLINES):
+            self.flush()
+
+    def close_spill_file(self) -> None:
+        """Flush and close the spill file, if one was opened. Safe to call more than once."""
+        with self._capture_lock:
+            if self._spill_file is not None:
+                with contextlib.suppress(OSError):
+                    self._spill_file.flush()
+                    self._spill_file.close()
+                self._spill_file = None
 
     def getvalue(self) -> str:
         """Get the internal contents as a str."""
@@ -520,8 +638,11 @@ class ByteBuf:
         """Add bytes to internal bytes buffer and if echo is True, echo contents to inner stream."""
         if not isinstance(b, bytes):
             raise TypeError(f"a bytes-like object is required, not {type(b)}")
+
+        overflow: bytes | None = None
         if not self.std_sim_instance.pause_storage:
-            self.byte_buf += b
+            overflow = self.std_sim_instance._capture(b)
+
         if self.std_sim_instance.echo:
             self.std_sim_instance.inner_stream.buffer.write(b)
 
@@ -531,6 +652,9 @@ class ByteBuf:
             # to the screen more often than if we waited for the stream to flush its buffer.
             if self.std_sim_instance.line_buffering and any(newline in b for newline in ByteBuf.NEWLINES):
                 self.std_sim_instance.flush()
+        elif overflow is not None:
+            # Budget exceeded without a spill file; continue the overflow at its original target.
+            self.std_sim_instance._write_inner_bytes(overflow)
 
 
 class ProcReader:

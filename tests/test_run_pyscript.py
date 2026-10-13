@@ -2,14 +2,22 @@
 
 import os
 import pathlib
+import sys
+from typing import (
+    TextIO,
+    cast,
+)
 from unittest import (
     mock,
 )
 
 import pytest
 
+import cmd2
 from cmd2 import rich_utils as ru
+from cmd2.py_bridge import PyBridge
 from cmd2.string_utils import quote
+from cmd2.utils import StdSim
 
 from .conftest import (
     odd_file_names,
@@ -142,6 +150,205 @@ def test_py_bridge_capture_isolation() -> None:
     # Verify isolation: only the application stream should be in the result
     assert result.stdout == "app_stdout\n"
     assert "process_stdout" not in result.stdout
+
+
+class BudgetApp(cmd2.Cmd):
+    """App used by the PyBridge capture-budget tests."""
+
+    @staticmethod
+    def big_output(count: int = 100) -> str:
+        return "".join(f"line-{i:03d}\n" for i in range(count))
+
+    @staticmethod
+    def big_error(count: int = 100) -> str:
+        return "".join(f"err-{i:03d}\n" for i in range(count))
+
+    def do_big(self, args: str) -> None:
+        count = int(args) if args.strip() else 100
+        for i in range(count):
+            self.poutput(f"line-{i:03d}")
+
+    def do_bigerr(self, _: str) -> None:
+        for i in range(100):
+            sys.stderr.write(f"err-{i:03d}\n")
+
+    def do_same(self, args: str) -> None:
+        count = int(args) if args.strip() else 50
+        for _ in range(count):
+            self.poutput("same-line")
+
+    def do_emit(self, _: str) -> None:
+        self.poutput("fixed-output")
+
+    def do_nested(self, _: str) -> None:
+        # A nested PyBridge call gets its own independent capture budget. Overflow that it does
+        # not retain must pass through to the capture of the enclosing PyBridge call.
+        result = PyBridge(self)("big 100", stdout_budget=20)
+        self.poutput("NESTED_PREFIX:" + result.stdout.replace("\n", "|"))
+
+
+def test_py_bridge_default_captures_everything() -> None:
+    app = BudgetApp()
+    result = PyBridge(app)("big 100")
+
+    assert result.stdout == BudgetApp.big_output()
+    assert not result.stdout_truncated
+    assert not result.stderr_truncated
+    assert result.stdout_log is None
+    assert result.stderr_log is None
+
+
+def test_py_bridge_stdout_budget_prefix_and_passthrough() -> None:
+    app = BudgetApp()
+
+    # Stand in for the original target of app.stdout, as an outer capture would provide.
+    original_target = StdSim(sys.stdout)
+    app.stdout = cast(TextIO, original_target)
+
+    result = PyBridge(app)("big 100", stdout_budget=36)
+    full_output = BudgetApp.big_output()
+
+    # The result retains only the beginning of the output.
+    assert result.stdout == full_output[:36]
+    assert result.stdout_truncated
+    assert result.stdout_log is None
+
+    # Everything beyond the budget continued to the original target.
+    assert original_target.getvalue() == full_output[36:]
+
+
+def test_py_bridge_zero_budget_passes_all_through() -> None:
+    app = BudgetApp()
+    original_target = StdSim(sys.stdout)
+    app.stdout = cast(TextIO, original_target)
+
+    result = PyBridge(app)("emit", stdout_budget=0)
+
+    assert result.stdout == ""
+    assert result.stdout_truncated
+    assert original_target.getvalue() == "fixed-output\n"
+
+
+def test_py_bridge_echo_with_budget_not_duplicated() -> None:
+    app = BudgetApp()
+    original_target = StdSim(sys.stdout)
+    app.stdout = cast(TextIO, original_target)
+
+    result = PyBridge(app)("emit", echo=True, stdout_budget=3)
+
+    assert result.stdout == "fix"
+    assert result.stdout_truncated
+    # Echo delivers the complete output once; budget pass-through must not write it again.
+    assert original_target.getvalue() == "fixed-output\n"
+
+
+def test_py_bridge_spill_stdout_to_directory(tmp_path: pathlib.Path) -> None:
+    log_dir = tmp_path / "created" / "on" / "demand"
+    app = BudgetApp()
+
+    result = PyBridge(app)("big 100", stdout_budget=64, overflow_dir=log_dir)
+    full_output = BudgetApp.big_output()
+
+    assert result.stdout == full_output[:64]
+    assert result.stdout_truncated
+    assert result.stderr_log is None
+
+    # The spill file is the complete log: retained prefix followed by all overflow.
+    assert result.stdout_log is not None
+    spill_path = pathlib.Path(result.stdout_log)
+    assert spill_path.parent == log_dir
+    assert spill_path.read_text(encoding="utf-8") == full_output
+
+
+def test_py_bridge_spill_stderr_to_directory(tmp_path: pathlib.Path) -> None:
+    app = BudgetApp()
+
+    result = PyBridge(app)("bigerr", stderr_budget=18, overflow_dir=tmp_path)
+    full_error = BudgetApp.big_error()
+
+    assert result.stderr == full_error[:18]
+    assert result.stderr_truncated
+    assert result.stdout_log is None
+
+    assert result.stderr_log is not None
+    assert pathlib.Path(result.stderr_log).read_text(encoding="utf-8") == full_error
+
+
+def test_py_bridge_no_spill_file_within_budget(tmp_path: pathlib.Path) -> None:
+    app = BudgetApp()
+    result = PyBridge(app)("emit", stdout_budget=1024, overflow_dir=tmp_path)
+
+    assert result.stdout == "fixed-output\n"
+    assert not result.stdout_truncated
+    assert result.stdout_log is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_py_bridge_truncated_stderr_counts_as_failure() -> None:
+    # A budget that leaves stderr empty must not make the result look successful.
+    app = BudgetApp()
+    result = PyBridge(app)("bigerr", stderr_budget=0)
+
+    assert result.stderr == ""
+    assert result.stderr_truncated
+    assert not bool(result)
+
+
+def test_py_bridge_negative_budget_raises() -> None:
+    app = BudgetApp()
+    with pytest.raises(ValueError, match="non-negative"):
+        PyBridge(app)("big 100", stdout_budget=-1)
+
+
+def test_py_bridge_budget_preserves_file_redirection(tmp_path: pathlib.Path) -> None:
+    app = BudgetApp()
+    out_file = tmp_path / "out.txt"
+
+    # File redirection replaces app.stdout, so the command output bypasses capture exactly
+    # as it does without a budget.
+    result = PyBridge(app)(f"emit > {out_file}", stdout_budget=5)
+
+    assert result.stdout == ""
+    assert not result.stdout_truncated
+    assert out_file.read_text(encoding="utf-8") == "fixed-output\n"
+
+
+def test_py_bridge_budget_preserves_pipe(running_pipe_process, tmp_path: pathlib.Path) -> None:
+    app = BudgetApp()
+
+    # Piped shell output comes back through StdSim.buffer and must honor the budget as well.
+    result = PyBridge(app)("same 50 | sort", stdout_budget=10, overflow_dir=tmp_path)
+
+    assert result.stdout_truncated
+    assert result.stdout_log is not None
+
+    # The retained prefix is exactly the first 10 bytes of the complete piped output. Compare
+    # against the spill bytes rather than a literal so line endings stay platform-independent.
+    raw_log = pathlib.Path(result.stdout_log).read_bytes()
+    assert result.stdout == raw_log[:10].decode("utf-8", errors="replace")
+
+    lines = raw_log.decode("utf-8").splitlines()
+    assert len(lines) == 50
+    assert all(line == "same-line" for line in lines)
+
+
+def test_py_bridge_nested_call_has_independent_budget() -> None:
+    app = BudgetApp()
+    full_output = BudgetApp.big_output()
+
+    # The outer call has no budget. The nested call inside do_nested has a 20 byte budget.
+    result = PyBridge(app)("nested")
+
+    assert not result.stdout_truncated
+
+    # The nested call retained only the first 20 bytes, surfaced through NESTED_PREFIX.
+    assert "NESTED_PREFIX:" + full_output[:20].replace("\n", "|") in result.stdout
+
+    # Its overflow reached the enclosing capture, starting exactly at the budget boundary.
+    assert result.stdout.startswith(full_output[20:])
+    assert "line-099" in result.stdout
+    # The nested prefix itself did not leak into the enclosing capture except via NESTED_PREFIX.
+    assert "line-000\n" not in result.stdout
 
 
 def test_run_pyscript_stop(base_app, request) -> None:

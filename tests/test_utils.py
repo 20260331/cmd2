@@ -1,7 +1,9 @@
 """Unit testing for cmd2/utils.py module."""
 
+import io
 import math
 import os
+import pathlib
 import signal
 import sys
 import time
@@ -181,6 +183,129 @@ def test_stdsim_line_buffering(base_app) -> None:
         bytes_to_write = b"hello\r"
         stdsim.buffer.write(bytes_to_write)
         assert os.path.getsize(file.name) == saved_size + len(bytes_to_write)
+
+
+def test_stdsim_budget_negative_raises() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        cu.StdSim(io.StringIO(), max_bytes=-1)
+
+
+def test_stdsim_budget_retains_prefix_and_passes_through() -> None:
+    # No echo and no spill directory: the prefix stays in the buffer, overflow continues
+    # to the original target. The boundary may fall in the middle of a write.
+    sink = io.StringIO()
+    stdsim = cu.StdSim(sink, max_bytes=5)
+
+    stdsim.write("Hel")
+    stdsim.write("lo,")
+    stdsim.write(" World")
+
+    assert stdsim.getvalue() == "Hello"
+    assert stdsim.truncated
+    assert stdsim.total_bytes == len("Hello, World")
+    assert sink.getvalue() == ", World"
+
+
+def test_stdsim_budget_zero_passes_everything_through() -> None:
+    sink = io.StringIO()
+    stdsim = cu.StdSim(sink, max_bytes=0)
+    stdsim.write("Hello")
+    assert stdsim.getvalue() == ""
+    assert stdsim.truncated
+    assert sink.getvalue() == "Hello"
+
+
+def test_stdsim_budget_not_exceeded() -> None:
+    sink = io.StringIO()
+    stdsim = cu.StdSim(sink, max_bytes=100)
+    stdsim.write("Hello")
+    assert stdsim.getvalue() == "Hello"
+    assert not stdsim.truncated
+    assert sink.getvalue() == ""
+
+
+def test_stdsim_budget_paused_writes_do_not_count() -> None:
+    sink = io.StringIO()
+    stdsim = cu.StdSim(sink, max_bytes=5)
+
+    stdsim.pause_storage = True
+    stdsim.write("a much longer string written while storage is paused")
+    assert stdsim.getvalue() == ""
+    assert not stdsim.truncated
+
+    stdsim.pause_storage = False
+    stdsim.write("123456")
+    assert stdsim.getvalue() == "12345"
+    assert stdsim.truncated
+
+
+def test_stdsim_budget_binary_passes_through_nested_stdsim() -> None:
+    # Overflow written through ByteBuf must reach a wrapping (outer) StdSim, where it is
+    # accounted against that outer StdSim's own settings.
+    outer = cu.StdSim(io.StringIO())
+    inner = cu.StdSim(outer, max_bytes=3)
+
+    inner.buffer.write(b"abcdef")
+
+    assert inner.getvalue() == "abc"
+    assert inner.truncated
+    assert outer.getbytes() == b"def"
+
+
+def test_stdsim_budget_echo_does_not_duplicate_overflow() -> None:
+    sink = io.StringIO()
+    stdsim = cu.StdSim(sink, echo=True, max_bytes=3)
+    stdsim.write("abcdef")
+
+    # Echo sends the complete write to the sink exactly once; overflow is not written again.
+    assert stdsim.getvalue() == "abc"
+    assert sink.getvalue() == "abcdef"
+
+
+def test_stdsim_budget_split_multibyte_char_does_not_raise() -> None:
+    sink = io.StringIO()
+    stdsim = cu.StdSim(sink, max_bytes=1)
+    stdsim.write("é")
+    # The default errors="replace" policy must keep prefix decoding working at the split byte.
+    assert stdsim.getvalue() == "\ufffd"
+    assert sink.getvalue()
+
+
+def test_stdsim_spill_file_holds_complete_output(tmp_path: pathlib.Path) -> None:
+    log_dir = tmp_path / "nested" / "logs"
+    stdsim = cu.StdSim(io.StringIO(), max_bytes=5, spill_dir=log_dir, spill_prefix="test-")
+
+    stdsim.write("Hello, ")
+    stdsim.write("World")
+
+    assert stdsim.getvalue() == "Hello"
+    assert stdsim.truncated
+    assert stdsim.spill_path is not None
+
+    spill_path = pathlib.Path(stdsim.spill_path)
+    assert spill_path.parent == log_dir
+    assert spill_path.name.startswith("test-")
+    assert spill_path.read_text(encoding="utf-8") == "Hello, World"
+
+    stdsim.close_spill_file()
+
+
+def test_stdsim_spill_binary_path(tmp_path: pathlib.Path) -> None:
+    stdsim = cu.StdSim(io.StringIO(), max_bytes=3, spill_dir=tmp_path)
+    stdsim.buffer.write(b"abcdef")
+
+    assert stdsim.getbytes() == b"abc"
+    assert stdsim.spill_path is not None
+    assert pathlib.Path(stdsim.spill_path).read_bytes() == b"abcdef"
+    stdsim.close_spill_file()
+
+
+def test_stdsim_no_spill_file_within_budget(tmp_path: pathlib.Path) -> None:
+    stdsim = cu.StdSim(io.StringIO(), max_bytes=100, spill_dir=tmp_path)
+    stdsim.write("hi")
+    assert not stdsim.truncated
+    assert stdsim.spill_path is None
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.fixture

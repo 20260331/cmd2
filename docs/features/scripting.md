@@ -71,8 +71,9 @@ application author.
 
 Without any work on the part of the designer, a scripter can take advantage of piecing together
 workflows using simple `app` calls. The result of a `run_pyscript` app call yields a
-[CommandResult][cmd2.CommandResult] object exposing four members: `stdout`, `stderr`, `stop`, and
-`data`.
+[CommandResult][cmd2.CommandResult] object exposing four primary members: `stdout`, `stderr`,
+`stop`, and `data`, plus capture-budget metadata (`stdout_truncated`, `stderr_truncated`,
+`stdout_log`, and `stderr_log`; see [Bounding captured output](#bounding-captured-output)).
 
 `stdout` and `stderr` are fairly straightforward representations of normal data streams and
 accurately reflect what the user sees during normal cmd2 interaction. `stop` contains information
@@ -106,6 +107,39 @@ See
 example and associated
 [conditional.py](https://github.com/python-cmd2/cmd2/blob/main/examples/scripts/conditional.py)
 script for more information.
+
+### Bounding captured output
+
+By default an `app` call holds every captured byte of `stdout` and `stderr` in memory until the call
+returns. Commands with very large output can therefore grow [CommandResult][cmd2.CommandResult]
+without limit. Pass per-call byte budgets to keep that memory bounded while still retaining the
+beginning of the output:
+
+```py
+result = app("generate_report", stdout_budget=65536, stderr_budget=65536)
+```
+
+When a budget is exceeded, `result.stdout` or `result.stderr` contains only the beginning of the
+stream and the corresponding `stdout_truncated` / `stderr_truncated` flag is set to `True`.
+
+Bytes beyond the budget do not disappear. With no further options they continue to the stream's
+original target, so output stays visible during the call. Nested `app` calls keep independent
+budgets: overflow from an inner call reaches the enclosing call's capture and is accounted against
+that enclosing budget.
+
+Alternatively, pass `overflow_dir` to stream the complete output, beginning included, into a
+uniquely named log file inside that directory (the directory is created if needed). The path is
+returned in `stdout_log` / `stderr_log`, and the file is only created if the corresponding budget is
+actually exceeded.
+
+```py
+result = app("generate_report", stdout_budget=65536, overflow_dir="logs")
+if result.stdout_truncated:
+    print(f"complete report written to {result.stdout_log}")
+```
+
+Output redirection (`>`, `>>`, and `|`) is unaffected: redirected or piped output bypasses the
+capture exactly as it does without a budget.
 
 ### Design principles
 
@@ -246,7 +280,7 @@ print(result)
 ```
 
     (Cmd) run_pyscript script.py
-    CommandResult(stdout='', stderr='Usage: speak [-h] [-p] [-s] [-r REPEAT] words [...]\nError: the following arguments are required: words\n\n', stop=False, data=None)
+    CommandResult(stdout='', stderr='Usage: speak [-h] [-p] [-s] [-r REPEAT] words [...]\nError: the following arguments are required: words\n\n', stop=False, data=None, stdout_truncated=False, stderr_truncated=False, stdout_log=None, stderr_log=None)
 
 Now we can see that there has been an error. Let's rewrite the script to perform error checking.:
 

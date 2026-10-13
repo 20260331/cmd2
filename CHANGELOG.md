@@ -1,3 +1,15 @@
+## Unreleased
+
+- Enhancements
+    - Added per-call stdout/stderr capture budgets to `PyBridge` calls (`app(...)`). New
+      `stdout_budget`, `stderr_budget`, and `overflow_dir` keyword arguments bound how much output
+      is retained in `CommandResult.stdout`/`stderr`: the beginning of the output stays available in
+      the result, bytes beyond a budget either continue to the stream's original target or are
+      streamed to a uniquely named complete log file in the given directory. `CommandResult` gains
+      `stdout_truncated`, `stderr_truncated`, `stdout_log`, and `stderr_log` fields. Nested
+      `PyBridge` calls keep independent budgets, and output redirection/piping semantics are
+      unchanged.
+
 ## 4.2.4 (September 8, 2026)
 
 - Bug Fixes
