@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from typing import (
+    Any,
     ClassVar,
     Generic,
 )
@@ -29,6 +30,14 @@ class CommandSet(Generic[CmdT]):
     # This value is inherited by subclasses but they can set their own
     # DEFAULT_CATEGORY to place their commands into a custom category.
     DEFAULT_CATEGORY: ClassVar[str] = "CommandSet Commands"
+
+    # CommandSet classes that must be installed before this one. A dependency is considered
+    # satisfied when an installed CommandSet is an instance of the declared type (subclasses
+    # count), or when another CommandSet in the same batch passed to
+    # cmd2.Cmd.activate_command_sets() matches. cmd2 resolves the dependency graph and installs
+    # the members of a batch in dependency order. Subclasses override this with a tuple of the
+    # CommandSet subclass types that this one relies on.
+    DEPENDS_ON: ClassVar[tuple[type["CommandSet[Any]"], ...]] = ()
 
     def __init__(self) -> None:
         """Private reference to the CLI instance in which this CommandSet running.

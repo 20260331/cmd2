@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from code import InteractiveConsole
 from collections import deque
 from collections.abc import (
@@ -528,6 +529,9 @@ class Cmd:
         # CommandSet containers
         self._installed_command_sets: set[CommandSet[Any]] = set()
         self._cmd_to_command_sets: dict[str, CommandSet[Any]] = {}
+        # CommandSets installed together via activate_command_sets(), keyed by the batch ID and
+        # stored in dependency (installation) order for use by deactivate_command_sets().
+        self._command_set_batches: dict[str, tuple[CommandSet[Any], ...]] = {}
 
         self.build_settables()
 
@@ -922,6 +926,68 @@ class Cmd:
 
         load_commandset_by_type(all_commandset_defs)
 
+    @staticmethod
+    def _get_commandset_do_methods(
+        cmdset: CommandSet[Any],
+    ) -> list[tuple[str, BoundCommandFunc[...]]]:
+        """Get all (attribute name, method) pairs on a CommandSet that implement commands.
+
+        This includes command synonyms since every attribute whose name starts with
+        COMMAND_FUNC_PREFIX is returned.
+        """
+        return cast(
+            list[tuple[str, BoundCommandFunc[...]]],
+            inspect.getmembers(
+                cmdset,
+                predicate=lambda meth: (  # type: ignore[arg-type]
+                    isinstance(meth, Callable)  # type: ignore[arg-type]
+                    and hasattr(meth, "__name__")
+                    and meth.__name__.startswith(COMMAND_FUNC_PREFIX)
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _get_commandset_subcommand_methods(
+        owner: CmdOrSet,
+    ) -> list[tuple[str, Callable[..., Any], SubcommandSpec]]:
+        """Get all (attribute name, method, spec) triples on an owner that define subcommands."""
+        methods = inspect.getmembers(
+            owner,
+            predicate=lambda meth: (
+                isinstance(meth, Callable)  # type: ignore[arg-type]
+                and hasattr(meth, constants.SUBCOMMAND_ATTR_SPEC)
+            ),
+        )
+        return [
+            (method_name, method, cast(SubcommandSpec, getattr(method, constants.SUBCOMMAND_ATTR_SPEC)))
+            for method_name, method in methods
+        ]
+
+    @staticmethod
+    def _iter_commandset_callable_attributes(
+        owner: CmdOrSet,
+    ) -> list[tuple[str, BoundCommandFunc[...]]]:
+        """Return (name, value) callable pairs on an owner without invoking properties.
+
+        Batch validation runs before a CommandSet is registered, when accessing its ``_cmd``
+        property raises, so inspect.getmembers() (which resolves every attribute) cannot be
+        used. This walks the instance dictionary and class hierarchy directly instead.
+        """
+        attributes: dict[str, Any] = dict(vars(owner))
+        for klass in type(owner).__mro__:
+            for name, value in vars(klass).items():
+                if name not in attributes:
+                    attributes[name] = value
+        return cast(  # ty: ignore[redundant-cast]
+            list[tuple[str, BoundCommandFunc[...]]],
+            [
+                (name, value)
+                for name, value in attributes.items()
+                if isinstance(value, Callable) and hasattr(value, "__name__")  # type: ignore[arg-type]
+            ],
+        )
+
     def register_command_set(self, cmdset: CommandSet[Any]) -> None:
         """Installs a CommandSet, loading all commands defined in the CommandSet.
 
@@ -946,17 +1012,7 @@ class Cmd:
                     raise CommandSetRegistrationError(f"Duplicate settable {key} is already registered")
 
         cmdset.on_register(self)
-        methods = cast(
-            list[tuple[str, BoundCommandFunc[...]]],
-            inspect.getmembers(
-                cmdset,
-                predicate=lambda meth: (  # type: ignore[arg-type]
-                    isinstance(meth, Callable)  # type: ignore[arg-type]
-                    and hasattr(meth, "__name__")
-                    and meth.__name__.startswith(COMMAND_FUNC_PREFIX)
-                ),
-            ),
-        )
+        methods = self._get_commandset_do_methods(cmdset)
 
         installed_attributes = []
         try:
@@ -992,6 +1048,9 @@ class Cmd:
             cmdset.on_registered()
         except Exception:
             cmdset.on_unregister()
+            # Detach any subcommands which were attached before the failure occurred.
+            if cmdset in self._installed_command_sets:
+                self._unregister_subcommands(cmdset)
             for attrib in installed_attributes:
                 delattr(self, attrib)
             if cmdset in self._installed_command_sets:
@@ -1116,17 +1175,7 @@ class Cmd:
             cmdset.on_unregister()
             self._unregister_subcommands(cmdset)
 
-            methods: list[tuple[str, BoundCommandFunc[...]]] = cast(
-                list[tuple[str, BoundCommandFunc[...]]],
-                inspect.getmembers(
-                    cmdset,
-                    predicate=lambda meth: (  # type: ignore[arg-type]
-                        isinstance(meth, Callable)  # type: ignore[arg-type]
-                        and hasattr(meth, "__name__")
-                        and meth.__name__.startswith(COMMAND_FUNC_PREFIX)
-                    ),
-                ),
-            )
+            methods = self._get_commandset_do_methods(cmdset)
 
             for cmd_func_name, command_method in methods:
                 command = cmd_func_name[len(COMMAND_FUNC_PREFIX) :]
@@ -1191,19 +1240,7 @@ class Cmd:
                     )
                 check_parser_uninstallable(subparser)
 
-        methods: list[tuple[str, BoundCommandFunc[...]]] = cast(
-            list[tuple[str, BoundCommandFunc[...]]],
-            inspect.getmembers(
-                cmdset,
-                predicate=lambda meth: (  # type: ignore[arg-type]
-                    isinstance(meth, Callable)  # type: ignore[arg-type]
-                    and hasattr(meth, "__name__")
-                    and meth.__name__.startswith(COMMAND_FUNC_PREFIX)
-                ),
-            ),
-        )
-
-        for cmd_func_name, command_method in methods:
+        for cmd_func_name, command_method in self._get_commandset_do_methods(cmdset):
             # We only need to check if it's safe to remove the parser if this
             # is the actual command since command synonyms don't own it.
             if cmd_func_name == command_method.__name__:
@@ -1219,19 +1256,8 @@ class Cmd:
         if not (owner is self or owner in self._installed_command_sets):
             raise CommandSetRegistrationError("Cannot register subcommands with an unregistered CommandSet")
 
-        # find methods that have the required attributes necessary to be recognized as a sub-command
-        methods = inspect.getmembers(
-            owner,
-            predicate=lambda meth: (
-                isinstance(meth, Callable)  # type: ignore[arg-type]
-                and hasattr(meth, constants.SUBCOMMAND_ATTR_SPEC)
-            ),
-        )
-
-        # iterate through all matching methods
-        for _method_name, method in methods:
-            spec: SubcommandSpec = getattr(method, constants.SUBCOMMAND_ATTR_SPEC)
-
+        # iterate through all methods defining subcommands
+        for _method_name, method, spec in self._get_commandset_subcommand_methods(owner):
             subcommand_valid, errmsg = self.statement_parser.is_valid_command(spec.name, is_subcommand=True)
             if not subcommand_valid:
                 raise CommandSetRegistrationError(f"Subcommand {spec.name} is not valid: {errmsg}")
@@ -1271,21 +1297,307 @@ class Cmd:
         if not (owner is self or owner in self._installed_command_sets):
             raise CommandSetRegistrationError("Cannot unregister subcommands with an unregistered CommandSet")
 
-        # find methods that have the required attributes necessary to be recognized as a sub-command
-        methods = inspect.getmembers(
-            owner,
-            predicate=lambda meth: (
-                isinstance(meth, Callable)  # type: ignore[arg-type]
-                and hasattr(meth, constants.SUBCOMMAND_ATTR_SPEC)
-            ),
-        )
-
-        # iterate through all matching methods
-        for _method_name, method in methods:
-            spec: SubcommandSpec = getattr(method, constants.SUBCOMMAND_ATTR_SPEC)
-
+        # iterate through all methods defining subcommands
+        for _method_name, _method, spec in self._get_commandset_subcommand_methods(owner):
             with contextlib.suppress(ValueError):
                 self.detach_subcommand(spec.command, spec.name)
+
+    def activate_command_sets(
+        self,
+        command_sets: Iterable[CommandSet[Any]],
+        *,
+        batch_id: str | None = None,
+    ) -> str:
+        """Atomically install multiple, possibly interdependent CommandSets as one batch.
+
+        Before the application is modified in any way, the dependency graph declared through
+        each CommandSet's ``DEPENDS_ON`` class variable is resolved and the whole batch is
+        checked for command, completer, help, settable, and subcommand conflicts. The members
+        then install in dependency order. If installation fails after those checks, every
+        CommandSet installed by this batch is fully uninstalled in reverse order, leaving the
+        application exactly as it was before the call.
+
+        :param command_sets: CommandSets to install together as a single atomic batch
+        :param batch_id: optional caller-chosen ID for later use with deactivate_command_sets();
+                         a unique uuid4 hex string is generated when omitted
+        :return: ID under which the batch was registered
+        :raises CommandSetRegistrationError: if validation or installation fails; in that case
+                                             nothing from this batch remains installed
+        """
+        batch = list(command_sets)
+        ordered = self._topologically_sort_commandsets(batch)
+        resolved_id = self._validate_command_set_batch(ordered, batch_id)
+
+        installed: list[CommandSet[Any]] = []
+        try:
+            for cmdset in ordered:
+                self.register_command_set(cmdset)
+                installed.append(cmdset)
+        except Exception as install_exc:
+            # Fully compensate this batch's changes, removing members in reverse install order.
+            rollback_errors: list[BaseException] = []
+            for cmdset in reversed(installed):
+                try:
+                    self.unregister_command_set(cmdset)
+                except Exception as rollback_exc:  # noqa: BLE001 - keep uninstalling to unwind the whole batch
+                    rollback_errors.append(rollback_exc)
+            if rollback_errors:
+                rollback_error = CommandSetRegistrationError("Failed to install CommandSet batch and rollback also failed")
+                rollback_error.add_note(f"Original install failure: {install_exc!r}")
+                raise rollback_error from rollback_errors[0]
+            raise
+
+        self._command_set_batches[resolved_id] = tuple(ordered)
+        return resolved_id
+
+    def deactivate_command_sets(self, batch_id: str) -> None:
+        """Atomically uninstall all CommandSets previously activated together as a batch.
+
+        Members are uninstalled in reverse installation order so that dependent CommandSets are
+        removed before the ones they depend on. If an uninstall unexpectedly fails, the members
+        already removed are reinstalled in their original order to restore application state
+        before the error is raised.
+
+        :param batch_id: ID returned from (or provided to) activate_command_sets()
+        :raises CommandSetRegistrationError: if the batch is unknown or cannot be uninstalled
+        """
+        members = self._command_set_batches.get(batch_id)
+        if members is None:
+            raise CommandSetRegistrationError(f"No active CommandSet batch with ID '{batch_id}'")
+
+        installed_members = [cmdset for cmdset in members if cmdset in self._installed_command_sets]
+        if not installed_members:
+            del self._command_set_batches[batch_id]
+            return
+
+        removed_member_ids = {id(cmdset) for cmdset in installed_members}
+
+        # Nothing outside the batch may still rely (through DEPENDS_ON) on a type whose only
+        # providers are being removed.
+        for other in self._installed_command_sets:
+            if id(other) in removed_member_ids:
+                continue
+            for dep_type in other.DEPENDS_ON:
+                remaining_providers = (
+                    isinstance(cmdset, dep_type)
+                    for cmdset in self._installed_command_sets
+                    if id(cmdset) not in removed_member_ids
+                )
+                if not any(remaining_providers) and any(isinstance(cmdset, dep_type) for cmdset in installed_members):
+                    raise CommandSetRegistrationError(
+                        f"Cannot deactivate CommandSet batch '{batch_id}': "
+                        f"'{type(other).__name__}' still depends on '{dep_type.__name__}'"
+                    )
+
+        # Uninstall in reverse installation order. _check_uninstallable() runs as part of
+        # unregister_command_set(), at which point dependent batch members are already gone.
+        uninstalled: list[CommandSet[Any]] = []
+        try:
+            for cmdset in reversed(installed_members):
+                self.unregister_command_set(cmdset)
+                uninstalled.append(cmdset)
+        except Exception as uninstall_exc:
+            # Compensate by reinstalling removed members in their original installation order.
+            reinstall_errors: list[BaseException] = []
+            for cmdset in reversed(uninstalled):
+                try:
+                    self.register_command_set(cmdset)
+                except Exception as reinstall_exc:  # noqa: BLE001 - keep reinstalling to restore prior state
+                    reinstall_errors.append(reinstall_exc)
+            if reinstall_errors:
+                rollback_error = CommandSetRegistrationError(
+                    f"Failed to uninstall CommandSet batch '{batch_id}' and restore its members"
+                )
+                rollback_error.add_note(f"Original uninstall failure: {uninstall_exc!r}")
+                raise rollback_error from reinstall_errors[0]
+            raise
+
+        del self._command_set_batches[batch_id]
+
+    def _topologically_sort_commandsets(self, batch: Sequence[CommandSet[Any]]) -> list[CommandSet[Any]]:
+        """Resolve DEPENDS_ON and return batch members in dependency installation order.
+
+        Dependencies already satisfied by installed CommandSets impose no ordering; edges are
+        only added between members of the batch. Ties keep the caller-supplied order so that
+        installation order stays deterministic.
+
+        :param batch: CommandSets to order, as provided by the caller
+        :return: batch members in the order in which they must be installed
+        :raises CommandSetRegistrationError: for invalid members, missing dependencies, or cycles
+        """
+        members: list[CommandSet[Any]] = []
+        member_ids: set[int] = set()
+        for cmdset in batch:
+            if not isinstance(cmdset, CommandSet):
+                raise CommandSetRegistrationError(f"Expected a CommandSet, got '{type(cmdset).__name__}'")
+            if id(cmdset) in member_ids:
+                raise CommandSetRegistrationError(
+                    f"CommandSet '{type(cmdset).__name__}' was provided more than once in the same batch"
+                )
+            member_ids.add(id(cmdset))
+            members.append(cmdset)
+
+        if not members:
+            raise CommandSetRegistrationError("At least one CommandSet must be provided to activate a batch")
+
+        dependencies: dict[int, set[int]] = {}
+        for cmdset in members:
+            cmdset_dependencies: set[int] = set()
+            for dep_type in cmdset.DEPENDS_ON:
+                if not isinstance(dep_type, type) or not issubclass(dep_type, CommandSet):
+                    raise CommandSetRegistrationError(
+                        f"DEPENDS_ON entries must be CommandSet subclasses, got {dep_type!r} on '{type(cmdset).__name__}'"
+                    )
+                # An already-installed provider satisfies the dependency without ordering work.
+                if any(isinstance(installed, dep_type) for installed in self._installed_command_sets):
+                    continue
+                batch_providers = [
+                    candidate for candidate in members if candidate is not cmdset and isinstance(candidate, dep_type)
+                ]
+                if not batch_providers:
+                    raise CommandSetRegistrationError(
+                        f"CommandSet '{type(cmdset).__name__}' depends on '{dep_type.__name__}', "
+                        f"which is neither installed nor included in this batch"
+                    )
+                cmdset_dependencies.update(id(provider) for provider in batch_providers)
+            dependencies[id(cmdset)] = cmdset_dependencies
+
+        # Kahn's algorithm. Caller order is preserved among independent members.
+        ordered: list[CommandSet[Any]] = []
+        remaining = {id(cmdset) for cmdset in members}
+        while remaining:
+            ready = [cmdset for cmdset in members if id(cmdset) in remaining and not (dependencies[id(cmdset)] & remaining)]
+            if not ready:
+                stuck_names = sorted(type(cmdset).__name__ for cmdset in members if id(cmdset) in remaining)
+                raise CommandSetRegistrationError("Cyclic CommandSet dependency detected involving: " + ", ".join(stuck_names))
+            for cmdset in ready:
+                ordered.append(cmdset)
+                remaining.remove(id(cmdset))
+
+        return ordered
+
+    def _validate_command_set_batch(
+        self,
+        ordered_batch: Sequence[CommandSet[Any]],
+        batch_id: str | None,
+    ) -> str:
+        """Run all conflict checks for a planned batch without modifying application state.
+
+        :param ordered_batch: batch members in planned installation order
+        :param batch_id: caller-chosen batch ID, or None to generate one
+        :return: the resolved batch ID
+        :raises CommandSetRegistrationError: if any check fails
+        """
+        if batch_id is None:
+            resolved_id = uuid.uuid4().hex
+            while resolved_id in self._command_set_batches:
+                resolved_id = uuid.uuid4().hex
+        else:
+            if not isinstance(batch_id, str) or not batch_id.strip():
+                raise CommandSetRegistrationError("batch_id must be a non-empty string")
+            if batch_id in self._command_set_batches:
+                raise CommandSetRegistrationError(f"CommandSet batch '{batch_id}' is already active")
+            resolved_id = batch_id
+
+        # Reject duplicate CommandSet types within the batch and against installed CommandSets.
+        installed_types = [type(cmdset) for cmdset in self._installed_command_sets]
+        batch_types: set[type[CommandSet[Any]]] = set()
+        for cmdset in ordered_batch:
+            cmdset_type = type(cmdset)
+            if cmdset_type in installed_types:
+                raise CommandSetRegistrationError(f"CommandSet {cmdset_type.__name__} is already installed")
+            if cmdset_type in batch_types:
+                raise CommandSetRegistrationError(f"Duplicate CommandSet type in batch: {cmdset_type.__name__}")
+            batch_types.add(cmdset_type)
+
+        # Settable conflicts, including across members of this batch.
+        projected_settables = set(self.settables)
+        for cmdset in ordered_batch:
+            if self.always_prefix_settables and not cmdset.settable_prefix.strip():
+                raise CommandSetRegistrationError("CommandSet settable prefix must not be empty")
+            for key in cmdset.settables:
+                projected_key = f"{cmdset.settable_prefix}.{key}" if self.always_prefix_settables else key
+                if projected_key in projected_settables:
+                    raise CommandSetRegistrationError(f"Duplicate settable: {key}")
+                projected_settables.add(projected_key)
+
+        # Command, completer, and help function conflicts against what is installed and the batch.
+        existing_attributes = set(self.get_names())
+        projected_attributes: set[str] = set()
+        projected_commands: set[str] = set(self.get_all_commands())
+        projected_subcommands: set[tuple[str, str]] = set()
+
+        for cmdset in ordered_batch:
+            cmdset_attributes = self._iter_commandset_callable_attributes(cmdset)
+            for cmd_func_name, command_method in cmdset_attributes:
+                # Mirror the getmembers predicate used at install time: the value's own
+                # __name__ must identify it as a command, regardless of attribute name.
+                if not command_method.__name__.startswith(COMMAND_FUNC_PREFIX):
+                    continue
+                if not cmd_func_name.startswith(COMMAND_FUNC_PREFIX):
+                    raise CommandSetRegistrationError(f"{cmd_func_name} does not begin with '{COMMAND_FUNC_PREFIX}'")
+                if cmd_func_name in existing_attributes or cmd_func_name in projected_attributes:
+                    raise CommandSetRegistrationError(f"Attribute already exists: {cmd_func_name} ({type(cmdset).__name__})")
+                command = cmd_func_name[len(COMMAND_FUNC_PREFIX) :]
+                valid, errmsg = self.statement_parser.is_valid_command(command)
+                if not valid:
+                    raise CommandSetRegistrationError(f"Invalid command name '{command}': {errmsg}")
+
+                projected_attributes.add(cmd_func_name)
+                projected_commands.add(command)
+
+                completer_func_name = COMPLETER_FUNC_PREFIX + command
+                if getattr(cmdset, completer_func_name, None) is not None:
+                    if completer_func_name in existing_attributes or completer_func_name in projected_attributes:
+                        raise CommandSetRegistrationError(f"Attribute already exists: {completer_func_name}")
+                    projected_attributes.add(completer_func_name)
+
+                help_func_name = HELP_FUNC_PREFIX + command
+                if getattr(cmdset, help_func_name, None) is not None:
+                    if help_func_name in existing_attributes or help_func_name in projected_attributes:
+                        raise CommandSetRegistrationError(f"Attribute already exists: {help_func_name}")
+                    projected_attributes.add(help_func_name)
+
+            # Subcommand checks: valid names, a resolvable base command, and no duplicates.
+            for _method_name, spec in [
+                (name, cast(SubcommandSpec, getattr(value, constants.SUBCOMMAND_ATTR_SPEC)))
+                for name, value in cmdset_attributes
+                if hasattr(value, constants.SUBCOMMAND_ATTR_SPEC)
+            ]:
+                valid, errmsg = self.statement_parser.is_valid_command(spec.name, is_subcommand=True)
+                if not valid:
+                    raise CommandSetRegistrationError(f"Subcommand {spec.name} is not valid: {errmsg}")
+
+                command_tokens = spec.command.split()
+                root_command = command_tokens[0] if command_tokens else ""
+                if root_command not in projected_commands:
+                    raise CommandSetRegistrationError(
+                        f"Cannot attach subcommand '{spec.name}' to '{spec.command}': "
+                        f"base command '{root_command}' is neither installed nor provided by this batch"
+                    )
+
+                for sub_name in (spec.name, *spec.aliases):
+                    pair = (spec.command, sub_name)
+                    if pair in projected_subcommands:
+                        raise CommandSetRegistrationError(
+                            f"Subcommand '{sub_name}' is already defined for '{spec.command}' in this batch"
+                        )
+                    projected_subcommands.add(pair)
+
+                # When the whole command path is already live, mirror attach_subcommand()'s
+                # duplicate detection. Paths provided later by this batch are validated at
+                # install time, where failure triggers a full batch rollback.
+                try:
+                    root_parser, subcommand_path = self.get_root_parser_and_subcmd_path(spec.command)
+                    target_parser = root_parser.find_parser(subcommand_path)
+                    subparsers_action = target_parser.get_subparsers_action()
+                except ValueError:
+                    continue
+                for sub_name in (spec.name, *spec.aliases):
+                    if sub_name in subparsers_action._name_parser_map:
+                        raise CommandSetRegistrationError(f"Subcommand '{sub_name}' already exists for '{target_parser.prog}'")
+
+        return resolved_id
 
     def get_root_parser_and_subcmd_path(self, command: str) -> tuple[Cmd2ArgumentParser, list[str]]:
         """Tokenize a command string and resolve the associated root parser and relative subcommand path.

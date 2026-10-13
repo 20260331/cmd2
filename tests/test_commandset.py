@@ -1206,3 +1206,425 @@ def test_ns_provider() -> None:
     app.unregister_command_set(ns_provider_set)
     run_cmd(app, "test_ns")
     assert app.last_result == app
+
+
+############################################################################################################
+# Batch activation / deactivation tests
+############################################################################################################
+
+
+class BatchBaseSet(cmd2.CommandSet):
+    """Base CommandSet which other batch members depend on."""
+
+    def __init__(self, dummy: int) -> None:
+        super().__init__()
+        self._dummy = dummy  # prevents autoload
+
+    def do_batch_base(self, _: cmd2.Statement) -> None:
+        """Batch base command."""
+        self._cmd.poutput("batch base")
+
+    cut_parser = cmd2.Cmd2ArgumentParser()
+    cut_subparsers = cut_parser.add_subparsers(required=True)
+
+    @cmd2.with_argparser(cut_parser)
+    def do_batch_cut(self, ns: argparse.Namespace) -> None:
+        """Cut something."""
+        ns.cmd2_subcommand_func(ns)
+
+
+class BatchChildSet(cmd2.CommandSet):
+    """CommandSet which depends on BatchBaseSet and injects a subcommand."""
+
+    DEPENDS_ON = (BatchBaseSet,)
+
+    def __init__(self, dummy: int) -> None:
+        super().__init__()
+        self._dummy = dummy  # prevents autoload
+
+    def do_batch_child(self, _: cmd2.Statement) -> None:
+        """Batch child command."""
+        self._cmd.poutput("batch child")
+
+    def complete_batch_child(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return ["batch-completion"]
+
+    sub_parser = cmd2.Cmd2ArgumentParser()
+
+    @cmd2.as_subcommand_to("batch_cut", "sub", sub_parser, help="sub command")
+    def batch_cut_sub(self, ns: argparse.Namespace) -> None:
+        self._cmd.poutput("batch subcommand ran")
+
+
+class BatchConflictingSet(cmd2.CommandSet):
+    """CommandSet whose command collides with BatchChildSet."""
+
+    def __init__(self, dummy: int) -> None:
+        super().__init__()
+        self._dummy = dummy  # prevents autoload
+
+    def do_batch_child(self, _: cmd2.Statement) -> None:
+        """Conflicting batch child command."""
+        self._cmd.poutput("conflict")
+
+
+class BatchFailingSet(cmd2.CommandSet):
+    """CommandSet whose on_register() raises after batch members were already installed."""
+
+    DEPENDS_ON = (BatchChildSet,)
+
+    def __init__(self, dummy: int) -> None:
+        super().__init__()
+        self._dummy = dummy  # prevents autoload
+
+    def on_register(self, cmd: object) -> None:
+        super().on_register(cmd)
+        raise RuntimeError("intentional on_register failure")
+
+    def do_batch_late(self, _: cmd2.Statement) -> None:
+        """Late batch command."""
+
+
+def test_batch_activate_installs_in_dependency_order(manual_command_sets_app) -> None:
+    # Provide the dependent before its dependency; activation must reorder by the dependency graph.
+    batch_id = manual_command_sets_app.activate_command_sets([BatchChildSet(1), BatchBaseSet(1)], batch_id="batch-plugin")
+    assert batch_id == "batch-plugin"
+
+    assert hasattr(manual_command_sets_app, "do_batch_base")
+    assert hasattr(manual_command_sets_app, "do_batch_child")
+    assert hasattr(manual_command_sets_app, "complete_batch_child")
+
+    # Subcommand injected by the child into the base command works.
+    result = manual_command_sets_app.app_cmd("batch_cut sub")
+    assert "batch subcommand ran" in result.stdout
+
+
+def test_batch_activate_generates_id(manual_command_sets_app) -> None:
+    batch_id = manual_command_sets_app.activate_command_sets([BatchBaseSet(1)])
+    assert isinstance(batch_id, str)
+    assert len(batch_id) == 32
+    int(batch_id, 16)
+
+    # The base from the first batch satisfies the child's dependency, so this is a distinct batch.
+    another_id = manual_command_sets_app.activate_command_sets([BatchChildSet(1)])
+    assert another_id != batch_id
+    assert hasattr(manual_command_sets_app, "do_batch_child")
+
+
+def test_batch_activate_conflict_within_batch_changes_nothing(manual_command_sets_app) -> None:
+    register_calls: list[str] = []
+
+    class TrackedChild(BatchChildSet):
+        def on_register(self, cmd: object) -> None:
+            register_calls.append(type(self).__name__)
+            super().on_register(cmd)
+
+    class TrackedConflict(BatchConflictingSet):
+        def on_register(self, cmd: object) -> None:
+            register_calls.append(type(self).__name__)
+            super().on_register(cmd)
+
+    with pytest.raises(CommandSetRegistrationError, match="do_batch_child"):
+        manual_command_sets_app.activate_command_sets([BatchBaseSet(1), TrackedChild(1), TrackedConflict(1)])
+
+    # Preflight must run before any member is touched.
+    assert not register_calls
+    assert not manual_command_sets_app._installed_command_sets
+    assert not hasattr(manual_command_sets_app, "do_batch_base")
+    assert not hasattr(manual_command_sets_app, "do_batch_child")
+
+
+def test_batch_activate_conflict_with_installed_command(manual_command_sets_app) -> None:
+    manual_command_sets_app.register_command_set(BatchBaseSet(1))
+
+    # A different type whose command collides with one that is already installed.
+    class DistinctTypeSet(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        def do_batch_base(self, _: cmd2.Statement) -> None:
+            """Collides with the installed base command."""
+
+    with pytest.raises(CommandSetRegistrationError, match="do_batch_base"):
+        manual_command_sets_app.activate_command_sets([DistinctTypeSet(1)])
+
+    # The already installed member is untouched and still usable.
+    assert hasattr(manual_command_sets_app, "do_batch_base")
+    result = manual_command_sets_app.app_cmd("batch_base")
+    assert "batch base" in result.stdout
+
+
+def test_batch_activate_missing_dependency(manual_command_sets_app) -> None:
+    with pytest.raises(CommandSetRegistrationError, match="BatchBaseSet"):
+        manual_command_sets_app.activate_command_sets([BatchChildSet(1)])
+    assert not manual_command_sets_app._installed_command_sets
+    assert not hasattr(manual_command_sets_app, "do_batch_child")
+
+
+def test_batch_activate_dependency_cycle(manual_command_sets_app) -> None:
+    class CycleOne(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        def do_cycle_one(self, _: cmd2.Statement) -> None:
+            """Cycle one."""
+
+    class CycleTwo(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        def do_cycle_two(self, _: cmd2.Statement) -> None:
+            """Cycle two."""
+
+    CycleOne.DEPENDS_ON = (CycleTwo,)
+    CycleTwo.DEPENDS_ON = (CycleOne,)
+
+    try:
+        with pytest.raises(CommandSetRegistrationError, match="Cyclic"):
+            manual_command_sets_app.activate_command_sets([CycleOne(1), CycleTwo(1)])
+        assert not manual_command_sets_app._installed_command_sets
+    finally:
+        CycleOne.DEPENDS_ON = ()
+        CycleTwo.DEPENDS_ON = ()
+
+
+def test_batch_activate_dependency_satisfied_by_installed(manual_command_sets_app) -> None:
+    manual_command_sets_app.register_command_set(BatchBaseSet(1))
+    # The dependency is already present, so the child activates on its own.
+    batch_id = manual_command_sets_app.activate_command_sets([BatchChildSet(1)], batch_id="child-only")
+    assert batch_id == "child-only"
+    assert hasattr(manual_command_sets_app, "do_batch_child")
+
+
+def test_batch_activate_runtime_failure_fully_compensates(manual_command_sets_app) -> None:
+    unregistered: list[str] = []
+
+    class TrackedBase(BatchBaseSet):
+        def on_unregistered(self) -> None:
+            unregistered.append(type(self).__name__)
+            super().on_unregistered()
+
+    class TrackedChild(BatchChildSet):
+        def on_unregistered(self) -> None:
+            unregistered.append(type(self).__name__)
+            super().on_unregistered()
+
+    with pytest.raises(RuntimeError, match="intentional"):
+        manual_command_sets_app.activate_command_sets([TrackedBase(1), TrackedChild(1), BatchFailingSet(1)])
+
+    # Every set installed before the failure is compensated, dependents first.
+    assert unregistered == ["TrackedChild", "TrackedBase"]
+    assert not manual_command_sets_app._installed_command_sets
+    assert not hasattr(manual_command_sets_app, "do_batch_base")
+    assert not hasattr(manual_command_sets_app, "do_batch_child")
+    assert not hasattr(manual_command_sets_app, "do_batch_late")
+
+    # The compensated instances are reusable in a new, successful activation.
+    manual_command_sets_app.activate_command_sets([TrackedBase(1), TrackedChild(1)], batch_id="retry")
+    assert hasattr(manual_command_sets_app, "do_batch_child")
+
+
+def test_batch_activate_rejects_duplicate_instances_and_types(manual_command_sets_app) -> None:
+    base = BatchBaseSet(1)
+    with pytest.raises(CommandSetRegistrationError, match="more than once"):
+        manual_command_sets_app.activate_command_sets([base, base])
+
+    with pytest.raises(CommandSetRegistrationError, match="Duplicate CommandSet type"):
+        manual_command_sets_app.activate_command_sets([BatchBaseSet(1), BatchBaseSet(1)])
+
+    with pytest.raises(CommandSetRegistrationError, match="Expected a CommandSet"):
+        manual_command_sets_app.activate_command_sets([object()])  # type: ignore[list-item]
+
+    with pytest.raises(CommandSetRegistrationError, match="At least one"):
+        manual_command_sets_app.activate_command_sets([])
+
+
+def test_batch_activate_rejects_invalid_and_duplicate_batch_id(manual_command_sets_app) -> None:
+    manual_command_sets_app.activate_command_sets([BatchBaseSet(1)], batch_id="unique-id")
+
+    with pytest.raises(CommandSetRegistrationError, match="already active"):
+        manual_command_sets_app.activate_command_sets([BatchChildSet(1), BatchBaseSet(1)], batch_id="unique-id")
+
+    with pytest.raises(CommandSetRegistrationError, match="non-empty string"):
+        manual_command_sets_app.activate_command_sets([BatchChildSet(1), BatchBaseSet(1)], batch_id="   ")
+
+
+def test_batch_activate_settable_conflict_changes_nothing(manual_command_sets_app) -> None:
+    class SettableOne(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+            self.add_settable(Settable("shared_setting", str, "shared settable", self))
+
+        def do_settable_one(self, _: cmd2.Statement) -> None:
+            """Settable one."""
+
+    class SettableTwo(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+            self.add_settable(Settable("shared_setting", str, "shared settable", self))
+
+        def do_settable_two(self, _: cmd2.Statement) -> None:
+            """Settable two."""
+
+    with pytest.raises(CommandSetRegistrationError, match="shared_setting"):
+        manual_command_sets_app.activate_command_sets([SettableOne(1), SettableTwo(1)])
+    assert not manual_command_sets_app._installed_command_sets
+    assert "shared_setting" not in manual_command_sets_app.settables
+
+
+def test_batch_activate_duplicate_subcommand_within_batch(manual_command_sets_app) -> None:
+    class FirstSubSet(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        first_parser = cmd2.Cmd2ArgumentParser()
+
+        @cmd2.as_subcommand_to("batch_cut", "same", first_parser)
+        def batch_cut_same_one(self, ns: argparse.Namespace) -> None:
+            """First same subcommand."""
+
+    class SecondSubSet(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        second_parser = cmd2.Cmd2ArgumentParser()
+
+        @cmd2.as_subcommand_to("batch_cut", "same", second_parser)
+        def batch_cut_same_two(self, ns: argparse.Namespace) -> None:
+            """Second same subcommand."""
+
+    with pytest.raises(CommandSetRegistrationError, match="same"):
+        manual_command_sets_app.activate_command_sets([BatchBaseSet(1), FirstSubSet(1), SecondSubSet(1)])
+    assert not manual_command_sets_app._installed_command_sets
+
+
+def test_batch_activate_duplicate_subcommand_against_installed(manual_command_sets_app) -> None:
+    manual_command_sets_app.register_command_set(BatchBaseSet(1))
+    manual_command_sets_app.register_command_set(BatchChildSet(1))
+
+    class DuplicateSubSet(cmd2.CommandSet):
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        dup_parser = cmd2.Cmd2ArgumentParser()
+
+        @cmd2.as_subcommand_to("batch_cut", "sub", dup_parser)
+        def batch_cut_sub_dup(self, ns: argparse.Namespace) -> None:
+            """Duplicate of an installed subcommand."""
+
+    with pytest.raises(CommandSetRegistrationError, match="sub"):
+        manual_command_sets_app.activate_command_sets([DuplicateSubSet(1)])
+    assert not hasattr(manual_command_sets_app, "do_batch_cut_sub_dup")
+
+
+def test_batch_activate_subcommand_runtime_failure_rolls_back(manual_command_sets_app) -> None:
+    class PartialSubSet(cmd2.CommandSet):
+        DEPENDS_ON = (BatchBaseSet,)
+
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        good_parser = cmd2.Cmd2ArgumentParser()
+
+        @cmd2.as_subcommand_to("batch_cut", "good", good_parser)
+        def batch_cut_good(self, ns: argparse.Namespace) -> None:
+            """Attachable subcommand."""
+
+        bad_parser = cmd2.Cmd2ArgumentParser()
+
+        # The hosting path does not exist, so this fails during installation, not preflight.
+        @cmd2.as_subcommand_to("batch_cut missing", "bad", bad_parser)
+        def batch_cut_bad(self, ns: argparse.Namespace) -> None:
+            """Unattachable subcommand."""
+
+    with pytest.raises(CommandSetRegistrationError):
+        manual_command_sets_app.activate_command_sets([BatchBaseSet(1), PartialSubSet(1)])
+    assert not manual_command_sets_app._installed_command_sets
+    assert not hasattr(manual_command_sets_app, "do_batch_base")
+
+
+def test_batch_deactivate_remembers_id_and_uninstalls_in_reverse(manual_command_sets_app) -> None:
+    events: list[str] = []
+
+    class TrackingBatchBase(BatchBaseSet):
+        def on_unregister(self) -> None:
+            events.append("base-unregister")
+            super().on_unregister()
+
+        def on_unregistered(self) -> None:
+            events.append("base-unregistered")
+            super().on_unregistered()
+
+    class TrackingBatchChild(BatchChildSet):
+        def on_unregister(self) -> None:
+            events.append("child-unregister")
+            super().on_unregister()
+
+        def on_unregistered(self) -> None:
+            events.append("child-unregistered")
+            super().on_unregistered()
+
+    batch_id = manual_command_sets_app.activate_command_sets([TrackingBatchChild(1), TrackingBatchBase(1)], batch_id="tracked")
+
+    manual_command_sets_app.deactivate_command_sets(batch_id)
+
+    # Dependents uninstall first so their subcommands are detached before the base goes away.
+    assert events == ["child-unregister", "child-unregistered", "base-unregister", "base-unregistered"]
+    assert not hasattr(manual_command_sets_app, "do_batch_base")
+    assert not hasattr(manual_command_sets_app, "do_batch_child")
+    assert not hasattr(manual_command_sets_app, "complete_batch_child")
+    assert batch_id not in manual_command_sets_app._command_set_batches
+
+
+def test_batch_deactivate_unknown_id(manual_command_sets_app) -> None:
+    with pytest.raises(CommandSetRegistrationError, match="No active CommandSet batch"):
+        manual_command_sets_app.deactivate_command_sets("does-not-exist")
+
+
+def test_batch_deactivate_blocked_by_external_dependency(manual_command_sets_app) -> None:
+    manual_command_sets_app.activate_command_sets([BatchBaseSet(1)], batch_id="base-batch")
+
+    class ExternalDependentSet(cmd2.CommandSet):
+        DEPENDS_ON = (BatchBaseSet,)
+
+        def __init__(self, dummy: int) -> None:
+            super().__init__()
+            self._dummy = dummy
+
+        def do_external_dependent(self, _: cmd2.Statement) -> None:
+            """External dependent."""
+
+    manual_command_sets_app.register_command_set(ExternalDependentSet(1))
+
+    with pytest.raises(CommandSetRegistrationError, match="still depends"):
+        manual_command_sets_app.deactivate_command_sets("base-batch")
+
+    # Nothing was removed.
+    assert "base-batch" in manual_command_sets_app._command_set_batches
+    assert hasattr(manual_command_sets_app, "do_batch_base")
+    assert hasattr(manual_command_sets_app, "do_external_dependent")
+
+
+def test_batch_deactivate_after_individual_unregister(manual_command_sets_app) -> None:
+    base = BatchBaseSet(1)
+    child = BatchChildSet(1)
+    batch_id = manual_command_sets_app.activate_command_sets([child, base], batch_id="partly-gone")
+
+    # A member may still be unregistered on its own (dependents first); deactivation then
+    # tolerates the missing member and finishes the job for what remains.
+    manual_command_sets_app.unregister_command_set(child)
+    assert not hasattr(manual_command_sets_app, "do_batch_child")
+    assert hasattr(manual_command_sets_app, "do_batch_base")
+
+    manual_command_sets_app.deactivate_command_sets(batch_id)
+    assert not hasattr(manual_command_sets_app, "do_batch_base")
+    assert batch_id not in manual_command_sets_app._command_set_batches

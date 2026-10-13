@@ -252,6 +252,74 @@ if __name__ == "__main__":
     app.cmdloop()
 ```
 
+### Atomic Batch Activation and Dependencies
+
+A plugin often consists of several CommandSets that rely on one another. Installing them one by one
+with [register_command_set][cmd2.Cmd.register_command_set] is fragile: if the second or third
+CommandSet fails to install, the earlier ones are left behind with half of the plugin's commands and
+completions active.
+
+A CommandSet can declare its dependencies with the `DEPENDS_ON` class variable, a tuple of
+CommandSet types that must be installed first:
+
+```py
+import cmd2
+from cmd2 import CommandSet
+
+
+class BaseCommands(CommandSet):
+    """Provides a command other CommandSets build on."""
+
+    def do_base(self, statement: cmd2.Statement) -> None:
+        """Base command."""
+        self._cmd.poutput("base command")
+
+
+class ClientCommands(CommandSet):
+    """Only makes sense once BaseCommands is available."""
+
+    DEPENDS_ON = (BaseCommands,)
+
+    def do_client(self, statement: cmd2.Statement) -> None:
+        """Client command."""
+        self._cmd.poutput("client command")
+```
+
+Use [activate_command_sets][cmd2.Cmd.activate_command_sets] to install a group of CommandSets as a
+single atomic batch. cmd2 resolves the dependency graph, installs the members in dependency order
+(so the order you pass them in does not matter), and remembers the group under a batch ID:
+
+```py
+# ClientCommands is installed after BaseCommands, even though it is listed first.
+batch_id = app.activate_command_sets(
+    [ClientCommands(), BaseCommands()],
+    batch_id="my-plugin",
+)
+```
+
+Before anything is modified, the whole batch is validated up front:
+
+- every dependency in `DEPENDS_ON` must resolve to an installed CommandSet (subclasses count) or to
+  another member of the same batch, and the dependency graph must not contain a cycle;
+- command, completer, help, and settable names must not collide with installed commands or with each
+  other inside the batch;
+- subcommands must have their base command available and must not duplicate existing subcommands.
+
+If any of these checks fail, no CommandSet in the batch is touched - not even its `on_register()`
+handler runs. If an error occurs later while installing the batch (for example a CommandSet's
+`on_register()` raises), every CommandSet that was already installed by the batch is fully
+uninstalled in reverse dependency order, leaving the application exactly as it was before the call.
+
+Pass `batch_id=None` (the default) to have a unique ID generated for you; the ID is always the
+return value. Later, uninstall the entire plugin at once with
+[deactivate_command_sets][cmd2.Cmd.deactivate_command_sets]. Members are removed in reverse
+installation order, and the call fails if some CommandSet outside the batch still depends on one
+being removed:
+
+```py
+app.deactivate_command_sets(batch_id)
+```
+
 ## Event Handlers
 
 The following functions are called at different points in the [CommandSet][cmd2.CommandSet] life

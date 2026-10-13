@@ -1,3 +1,12 @@
+## Unreleased
+
+- Enhancements
+    - Added `DEPENDS_ON` to `CommandSet` and `Cmd.activate_command_sets()` /
+      `Cmd.deactivate_command_sets()` for installing and removing groups of interdependent
+      CommandSets atomically under a batch ID. Activation resolves the dependency graph, validates
+      command/completer/help/settable/subcommand conflicts before changing anything, installs in
+      dependency order, and fully rolls back the whole batch if installation fails.
+
 ## 4.2.4 (September 8, 2026)
 
 - Bug Fixes
