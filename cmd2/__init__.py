@@ -48,6 +48,14 @@ from .exceptions import (
     SkipPostcommandHooks,
 )
 from .parsing import Statement
+from .preview import (
+    PlanError,
+    PlannedCommand,
+    PlannedPyscript,
+    PlannedRedirection,
+    PlannedScript,
+    PreviewPlan,
+)
 from .py_bridge import CommandResult
 from .rich_utils import (
     ArgumentDefaultsCmd2HelpFormatter,
@@ -93,6 +101,13 @@ __all__: list[str] = [  # noqa: RUF022
     "Completions",
     # Annotated commands
     "ArgumentBlock",
+    # Preview
+    "PlanError",
+    "PlannedCommand",
+    "PlannedPyscript",
+    "PlannedRedirection",
+    "PlannedScript",
+    "PreviewPlan",
     # Decorators
     "with_annotated",
     "with_argument_list",

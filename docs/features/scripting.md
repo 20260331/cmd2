@@ -42,6 +42,34 @@ Comments are useful in scripts, but are generally not used within an interactive
     (Cmd) # this is a comment
     (Cmd) command # this is not a comment
 
+## Previewing Commands and Scripts
+
+Before running a batch of command lines or a text script, an application can show exactly what would
+execute by calling [Cmd.preview](../api/cmd.md#cmd2.Cmd.preview). It accepts a single command line
+or an iterable of lines (including history items) and returns a [PreviewPlan](../api/preview.md) in
+which shortcuts, aliases, and macros are fully expanded and text scripts referenced by `run_script`
+and `_relative_run_script` are read and nested using the same inclusion rules as a real run.
+
+Each planned command records the resolved command, arguments, and a description of its output
+redirection (`>`, `>>`, `|`, or the clipboard). `run_pyscript` invocations are recorded as opaque
+steps, because a Python script can only be expanded by executing it.
+
+Building a plan is strictly read-only. Command functions and hooks are never called, argparse
+conversion is never performed, shell and pipe processes are never started, the clipboard is never
+touched, redirection files are never created, and application state (such as history) is not
+modified. Unreadable scripts, invalid quoting, macros with too few arguments, and incomplete
+multiline commands are collected as plan errors instead of aborting the whole batch.
+
+```py
+plan = app.preview(["@deployment.txt", "!echo done > status.log"])
+
+if not plan.ok:
+    for error in plan.errors:
+        print(f"{error.source}:{error.line_number}: {error.message}")
+else:
+    print(plan.render())
+```
+
 ## Python Scripts
 
 If you require logic flow, loops, branching, or other advanced features, you can write a python

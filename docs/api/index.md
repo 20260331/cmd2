@@ -27,6 +27,8 @@ incremented according to the [Semantic Version Specification](https://semver.org
 - [cmd2.history](./history.md) - classes for storing the history of previously entered commands
 - [cmd2.parsing](./parsing.md) - classes for parsing and storing user input
 - [cmd2.plugin](./plugin.md) - data classes for hook methods
+- [cmd2.preview](./preview.md) - read-only plans of what commands would execute after alias, macro,
+  and redirection expansion
 - [cmd2.pt_utils](./pt_utils.md) - utilities related to prompt-toolkit
 - [cmd2.py_bridge](./py_bridge.md) - classes for bridging calls from the embedded python environment
   to the host app

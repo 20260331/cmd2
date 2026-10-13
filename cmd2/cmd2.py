@@ -163,6 +163,16 @@ from .parsing import (
     StatementParser,
     shlex_split,
 )
+from .preview import (
+    PlanError,
+    PlannedCommand,
+    PlannedPyscript,
+    PlannedRedirection,
+    PlannedScript,
+    PlanStep,
+    PreviewPlan,
+    _redirection_from_statement,
+)
 from .rich_utils import (
     Cmd2BaseConsole,
     Cmd2ExceptionConsole,
@@ -337,6 +347,21 @@ class _ConsoleCache(threading.local):
 
     stdout: Cmd2BaseConsole | None = None
     stderr: Cmd2BaseConsole | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreviewContext:
+    """State tracked while building a read-only preview plan.
+
+    This is kept separate from a Cmd instance's runtime state so building a preview never mutates
+    the application (e.g. its _script_dir stack).
+
+    :ivar script_dirs: LIFO stack of directories of the scripts currently being expanded
+    :ivar include_chain: resolved paths of scripts in the current inclusion branch
+    """
+
+    script_dirs: tuple[str, ...] = ()
+    include_chain: tuple[str, ...] = ()
 
 
 class Cmd:
@@ -3162,6 +3187,281 @@ class Cmd:
                     break
 
         return False
+
+    def preview(self, lines: str | Iterable[str | HistoryItem]) -> PreviewPlan:
+        """Build a read-only plan of what would execute after alias, macro, and redirection expansion.
+
+        This reuses the application's normal command parser (shortcuts and aliases), macro
+        resolution, and text script inclusion rules (``run_script`` and
+        ``_relative_run_script``) to describe what running the given lines would do. It is
+        strictly side-effect free:
+
+            - command functions (``do_*``) and ``default()`` are never called
+            - no hooks of any kind are called
+            - argparse argument conversion is never performed
+            - shell commands and pipe processes are never started
+            - the clipboard is never read or written
+            - redirection files are never opened or created
+            - application state such as history and the script directory stack is not modified
+
+        Text script files referenced by ``run_script`` and ``_relative_run_script`` are read and
+        expanded in place, using the same path resolution and directory nesting as a real run.
+        ``run_pyscript`` invocations are recorded as opaque steps because Python scripts can
+        only be expanded by executing them.
+
+        A single string is treated as one command line; an iterable is treated as a batch of
+        lines (and may contain HistoryItem objects). Blank lines and comments produce no steps.
+        Problems such as invalid quoting, macros with too few arguments, incomplete multiline
+        commands, and unreadable scripts are collected as
+        [PlanError][cmd2.preview.PlanError] steps instead of being raised.
+
+        :param lines: a command line or an iterable of command lines to preview
+        :return: a [PreviewPlan][cmd2.preview.PreviewPlan] describing the expanded execution
+        """
+        if isinstance(lines, str):
+            lines = (lines,)
+
+        # Seed from a script already running on this Cmd so _relative_run_script resolves the
+        # same way it would at runtime; use tuples so the runtime stack is never modified.
+        context = _PreviewContext(script_dirs=tuple(self._script_dir))
+
+        steps: list[PlanStep] = []
+        for line_number, line in enumerate(lines, start=1):
+            if isinstance(line, HistoryItem):
+                line = line.raw  # noqa: PLW2901
+            steps.extend(self._preview_line(line, source=None, line_number=line_number, context=context))
+
+        return PreviewPlan(tuple(steps))
+
+    def _preview_line(
+        self, line: str, *, source: str | None, line_number: int, context: _PreviewContext
+    ) -> tuple[PlanStep, ...]:
+        """Expand one authored line into zero or more plan steps.
+
+        :param line: the line to expand
+        :param source: path of the script containing the line, or None for caller-provided input
+        :param line_number: 1-based line number within the source
+        :param context: current preview inclusion state
+        :return: the plan steps produced by this line (empty for blank lines/comments)
+        """
+        statement, error_message = self._preview_line_to_statement(line)
+
+        if error_message is not None:
+            return (PlanError(raw=line, source=source, line_number=line_number, message=error_message),)
+
+        if statement is None:
+            # Blank line or comment; these are silently skipped at runtime.
+            return ()
+
+        command = statement.command
+
+        if command == "run_script":
+            return (self._preview_script(statement, source=source, line_number=line_number, context=context, relative=False),)
+
+        if command == "_relative_run_script":
+            return (self._preview_script(statement, source=source, line_number=line_number, context=context, relative=True),)
+
+        if command == "run_pyscript":
+            return (self._preview_pyscript(statement, source=source, line_number=line_number),)
+
+        return (self._preview_command(statement, source=source, line_number=line_number),)
+
+    def _preview_line_to_statement(self, line: str) -> tuple[Statement | None, str | None]:
+        """Parse a line and resolve macros without performing I/O.
+
+        This mirrors _input_line_to_statement(), but never prompts for multiline continuation,
+        never prints errors, and never raises: problems are returned as an error message.
+
+        :param line: the line being parsed
+        :return: a (Statement, None) pair, a (None, None) pair for blank lines and comments, or a
+                 (None, error_message) pair when the line cannot be parsed
+        """
+        used_macros: list[str] = []
+        orig_line: str | None = None
+
+        # Continue until all macros are resolved
+        while True:
+            try:
+                statement = self._check_statement_complete(line)
+            except IncompleteStatement:
+                return None, "Incomplete multiline command; the preview cannot provide continuation input"
+            except Cmd2ShlexError as ex:
+                return None, f"Invalid syntax: {ex}"
+            except EmptyStatement:
+                return None, None
+
+            if orig_line is None:
+                orig_line = statement.raw
+
+            # Check if this command matches a macro and wasn't already processed to avoid an infinite loop
+            if statement.command in self.macros and statement.command not in used_macros:
+                used_macros.append(statement.command)
+                try:
+                    line = self._resolve_macro(statement)
+                except MacroError as ex:
+                    return None, str(ex)
+            else:
+                # No macro found or already processed. The statement is complete.
+                break
+
+        # Restore original 'raw' text if a macro was expanded
+        if orig_line != statement.raw:
+            statement_dict = statement.to_dict()
+            statement_dict["raw"] = orig_line
+            statement = Statement.from_dict(statement_dict)
+
+        return statement, None
+
+    def _preview_redirection(self, statement: Statement) -> PlannedRedirection | None:
+        """Describe the statement's redirection without opening files or starting processes."""
+        return _redirection_from_statement(
+            statement,
+            allow_redirection=self.allow_redirection,
+            allow_clipboard=self.allow_clipboard,
+        )
+
+    def _preview_command(self, statement: Statement, *, source: str | None, line_number: int) -> PlannedCommand:
+        """Build a plan step for a regular (non script-including) command."""
+        shell_command: str | None = None
+        if statement.command == "shell":
+            # Mirror do_shell(): preserve quotes and expand ~ in the shell command tokens
+            shell_tokens = statement.arg_list
+            utils.expand_user_in_tokens(shell_tokens)
+            shell_command = " ".join(shell_tokens)
+
+        return PlannedCommand(
+            raw=statement.raw,
+            command=statement.command,
+            args=statement.args,
+            argv=tuple(statement.argv),
+            expanded=statement.expanded_command_line,
+            statement=statement,
+            source=source,
+            line_number=line_number,
+            redirection=self._preview_redirection(statement),
+            recognized=self.get_command_func(statement.command) is not None,
+            shell_command=shell_command,
+        )
+
+    def _preview_pyscript(self, statement: Statement, *, source: str | None, line_number: int) -> PlannedPyscript | PlanError:
+        """Build an opaque plan step for a run_pyscript invocation."""
+        argv = statement.argv
+        if len(argv) < 2:
+            return PlanError(
+                raw=statement.raw,
+                source=source,
+                line_number=line_number,
+                message="run_pyscript requires a script path",
+            )
+
+        return PlannedPyscript(
+            raw=statement.raw,
+            path=os.path.expanduser(argv[1]),
+            arguments=tuple(argv[2:]),
+            source=source,
+            line_number=line_number,
+            redirection=self._preview_redirection(statement),
+        )
+
+    def _preview_script(
+        self,
+        statement: Statement,
+        *,
+        source: str | None,
+        line_number: int,
+        context: _PreviewContext,
+        relative: bool,
+    ) -> PlannedScript | PlanError:
+        """Read and expand a run_script/_relative_run_script inclusion using the runtime rules."""
+        command = statement.command
+        argv = statement.argv
+
+        if len(argv) < 2:
+            return PlanError(
+                raw=statement.raw,
+                source=source,
+                line_number=line_number,
+                message=f"{command} requires a script path",
+            )
+
+        # Mirror do_run_script()/do__relative_run_script() path resolution without argparse
+        path_arg = argv[1]
+        if relative:
+            base_dir = context.script_dirs[-1] if context.script_dirs else ""
+            path_arg = os.path.join(base_dir, path_arg)
+        expanded_path = os.path.abspath(os.path.expanduser(path_arg))
+
+        warnings: list[str] = []
+        if expanded_path.endswith(".py"):
+            # do_run_script() warns and asks the user whether to continue; a preview cannot prompt
+            warnings.append("appears to be a Python file; run_script would prompt before treating it as a text script")
+
+        # Validate and read the script the same way do_run_script() does, without side effects
+        script_lines, script_error = self._preview_read_script_lines(expanded_path)
+        if script_error is not None:
+            return PlanError(raw=statement.raw, source=source, line_number=line_number, message=script_error)
+
+        children: tuple[PlanStep, ...] = ()
+        if script_lines is not None:
+            if expanded_path in context.include_chain:
+                # Real applications recurse forever in this case; stop here to keep the preview finite
+                children = (
+                    PlanError(
+                        raw=statement.raw,
+                        source=source,
+                        line_number=line_number,
+                        message=f"Recursively including script '{expanded_path}' would never terminate",
+                    ),
+                )
+            else:
+                child_context = _PreviewContext(
+                    script_dirs=(*context.script_dirs, os.path.dirname(expanded_path)),
+                    include_chain=(*context.include_chain, expanded_path),
+                )
+                child_steps: list[PlanStep] = []
+                for child_line_number, script_line in enumerate(script_lines, start=1):
+                    child_steps.extend(
+                        self._preview_line(
+                            script_line,
+                            source=expanded_path,
+                            line_number=child_line_number,
+                            context=child_context,
+                        )
+                    )
+                children = tuple(child_steps)
+
+        return PlannedScript(
+            raw=statement.raw,
+            command=command,
+            path=expanded_path,
+            relative=relative,
+            source=source,
+            line_number=line_number,
+            children=children,
+            redirection=self._preview_redirection(statement),
+            warnings=tuple(warnings),
+        )
+
+    def _preview_read_script_lines(self, expanded_path: str) -> tuple[list[str] | None, str | None]:
+        """Validate and read a text script the way do_run_script() does, read-only.
+
+        :param expanded_path: absolute path of the script to read
+        :return: a (lines, None) pair with the script's lines, a (None, None) pair for an empty
+                 file, or a (None, error_message) pair when the file cannot be included
+        """
+        try:
+            # An empty file is not an error, it simply provides no commands
+            if os.path.getsize(expanded_path) == 0:
+                return None, None
+
+            # Make sure the file is ASCII or UTF-8 encoded text
+            if not utils.is_text_file(expanded_path):
+                return None, f"'{expanded_path}' is not an ASCII or UTF-8 encoded text file"
+
+            with open(expanded_path, encoding="utf-8") as target:
+                return target.read().splitlines(), None
+        except OSError as ex:
+            return None, f"Problem accessing script from '{expanded_path}': {ex}"
 
     def _check_statement_complete(self, line: str) -> Statement:
         """Check if the given line is a complete statement.

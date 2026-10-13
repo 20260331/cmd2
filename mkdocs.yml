@@ -209,6 +209,7 @@ nav:
       - api/history.md
       - api/parsing.md
       - api/plugin.md
+      - api/preview.md
       - api/pt_utils.md
       - api/py_bridge.md
       - api/rich_utils.md
