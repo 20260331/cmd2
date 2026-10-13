@@ -267,6 +267,21 @@ class Cmd2History(History):
     def store_string(self, string: str) -> None:
         """No-op: Persistent history data is stored in cmd2.Cmd.history."""
 
+    def replace_matching_string(self, old: str, new: str) -> bool:
+        """Replace the most recent history entry when it still matches *old*.
+
+        This keeps the interactive up-arrow history and auto-suggestions free of
+        sensitive values after cmd2 redacts the command it just accepted.
+
+        :param old: the line as entered at the prompt
+        :param new: the redacted line to store instead
+        :return: True when an entry was replaced
+        """
+        if self._loaded_strings and self._loaded_strings[0] == old:
+            self._loaded_strings[0] = new
+            return True
+        return False
+
     def load_history_strings(self) -> Iterable[str]:
         """Yield strings from newest to oldest."""
         yield from self._loaded_strings

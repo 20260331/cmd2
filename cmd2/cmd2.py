@@ -110,6 +110,7 @@ from . import (
     argparse_utils,
     constants,
     plugin,
+    redaction,
     utils,
 )
 from . import rich_utils as ru
@@ -3146,10 +3147,14 @@ class Cmd:
         """
         for line in cmds:
             if isinstance(line, HistoryItem):
+                # A redacted history item only holds placeholders, so never replay it as a command.
+                if getattr(line.statement, "redacted", False):
+                    self.perror("Skipping a history item with redacted sensitive arguments.")
+                    continue
                 line = line.raw  # noqa: PLW2901
 
             if self.echo:
-                self.poutput(f"{self.prompt}{line}")
+                self.poutput(f"{self.prompt}{self._redacted_line_for_display(line)}")
 
             try:
                 if self.onecmd_plus_hooks(
@@ -3501,7 +3506,9 @@ class Cmd:
                 and statement.command not in self.disabled_commands
                 and add_to_history
             ):
-                self.history.append(statement)
+                # Store a redacted copy when the command has sensitive arguments so tokens,
+                # passwords, and similar secrets never enter cmd2-managed history.
+                self.history.append(self._statement_for_history(statement, command_func))
 
             try:
                 self.current_command = statement
@@ -3513,6 +3520,69 @@ class Cmd:
             stop = self.default(statement)
 
         return stop if stop is not None else False
+
+    def _statement_for_history(self, statement: Statement, command_func: BoundCommandFunc[...]) -> Statement:
+        """Return the statement to store in history, redacting sensitive arguments when needed.
+
+        The command function always receives the original statement with its real values. This
+        redacted copy is only used by cmd2-managed diagnostics. It also replaces the matching
+        prompt-toolkit up-arrow history entry so the interactive session stays secret-free.
+
+        :param statement: the statement about to be executed
+        :param command_func: the command function which will execute the statement
+        :return: the original statement or a redacted copy flagged with ``redacted=True``
+        """
+        parser = self.command_parsers.get(command_func)
+        if parser is None:
+            return statement
+
+        redaction_result = redaction.redact_statement(parser, statement)
+        if redaction_result is None:
+            return statement
+
+        redacted_statement, _sensitive_values = redaction_result
+
+        # prompt-toolkit records the typed line independently for up-arrow navigation and
+        # auto-suggestions; replace the line just entered with its redacted form.
+        cast(Cmd2History, self.main_session.history).replace_matching_string(statement.raw, redacted_statement.raw)
+
+        return redacted_statement
+
+    def _redacted_line_for_display(self, line: str) -> str:
+        """Redact sensitive argument values from *line* before it is echoed (scripts, piped input).
+
+        :param line: the command line which may end with a newline
+        :return: the line to display, with sensitive values replaced when a parser declares them
+        """
+        if not line:
+            return line
+
+        trailing_newline = line.endswith("\n")
+        try:
+            statement = self.statement_parser.parse(line.rstrip("\r\n"))
+        except Exception:  # noqa: BLE001
+            # Echo must never break command execution because redaction failed.
+            return line
+
+        if not statement.command:
+            return line
+
+        command_func = self.get_command_func(statement.command)
+        if command_func is None:
+            return line
+
+        parser = self.command_parsers.get(command_func)
+        if parser is None:
+            return line
+
+        redaction_result = redaction.redact_statement(parser, statement)
+        if redaction_result is None:
+            return line
+
+        redacted_line = redaction_result[0].raw
+        if trailing_newline and not redacted_line.endswith("\n"):
+            redacted_line += "\n"
+        return redacted_line
 
     def default(self, statement: Statement) -> bool | None:
         """Execute when the command given isn't a recognized command implemented by a do_* method.
@@ -3604,9 +3674,10 @@ class Cmd:
         # live session. Print the prompt and the command so they appear in the
         # output stream before the results.
         if not self.interactive_pipe and self.echo:
-            end = "" if line.endswith("\n") else "\n"
+            display_line = self._redacted_line_for_display(line)
+            end = "" if display_line.endswith("\n") else "\n"
 
-            self.poutput(f"{prompt_str}{line}", end=end)
+            self.poutput(f"{prompt_str}{display_line}", end=end)
 
         return line.rstrip("\r\n")
 
@@ -5375,7 +5446,18 @@ class Cmd:
                 self.perror("Cowardly refusing to run all previously entered commands.")
                 self.perror("If this is what you want to do, specify '1:' as the range of history.")
             else:
-                stop = self.runcmds_plus_hooks(list(history.values()))
+                # Redacted history items only contain a placeholder, never the real value, so they
+                # can never be safely replayed; skip them instead of running a bogus command.
+                items_to_run: list[HistoryItem] = []
+                for item_index, item in history.items():
+                    if getattr(item.statement, "redacted", False):
+                        self.perror(
+                            f"Skipping history item {item_index}: it contains redacted sensitive "
+                            f"arguments and cannot be re-run."
+                        )
+                    else:
+                        items_to_run.append(item)
+                stop = self.runcmds_plus_hooks(items_to_run)
                 self.last_result = True
                 return stop
         elif args.edit:
@@ -5383,10 +5465,10 @@ class Cmd:
             fobj: TextIO
             with os.fdopen(fd, "w") as fobj:
                 for command in history.values():
-                    if command.statement.multiline_command:
-                        fobj.write(f"{command.expanded}\n")
-                    else:
-                        fobj.write(f"{command.raw}\n")
+                    command_line = command.expanded if command.statement.multiline_command else command.raw
+                    if getattr(command.statement, "redacted", False):
+                        command_line = self._comment_out_redacted(command_line)
+                    fobj.write(f"{command_line}\n")
             try:
                 self.run_editor(fname)
 
@@ -5399,10 +5481,10 @@ class Cmd:
             try:
                 with open(full_path, "w") as fobj:
                     for item in history.values():
-                        if item.statement.multiline_command:
-                            fobj.write(f"{item.expanded}\n")
-                        else:
-                            fobj.write(f"{item.raw}\n")
+                        command_line = item.expanded if item.statement.multiline_command else item.raw
+                        if getattr(item.statement, "redacted", False):
+                            command_line = self._comment_out_redacted(command_line)
+                        fobj.write(f"{command_line}\n")
                 plural = "" if len(history) == 1 else "s"
             except OSError as ex:
                 self.perror(f"Error saving history file '{full_path}': {ex}")
@@ -5439,6 +5521,16 @@ class Cmd:
             # Get a copy of the history so it doesn't get mutated while we are using it
             history = self.history.span(":", args.all)
         return history
+
+    @staticmethod
+    def _comment_out_redacted(command_line: str) -> str:
+        """Comment out every line of a redacted command saved to a script.
+
+        Script lines starting with the comment character are ignored by run_script, so a
+        saved script can never replay a command whose secret was replaced by a placeholder.
+        """
+        commented = "\n".join(f"{constants.COMMENT_CHAR} {part}" for part in command_line.splitlines())
+        return commented or f"{constants.COMMENT_CHAR} "
 
     def _initialize_history(self, hist_file: str) -> None:
         """Initialize history using history related attributes.

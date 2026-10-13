@@ -382,6 +382,7 @@ class _BaseArgMetadata:
         "completer": "completer",
         "table_columns": "table_columns",
         "suppress_tab_hint": "suppress_tab_hint",
+        "sensitive": "sensitive",
         "nargs": "nargs",
     }
 
@@ -410,6 +411,7 @@ class _BaseArgMetadata:
         completer: UnboundCompleter[CmdOrSetT] | None = None,
         table_columns: Sequence[str | Column] | None = None,
         suppress_tab_hint: bool | None = None,
+        sensitive: bool | None = None,
         const: Any = _UNSET,
         default: Any = _UNSET,
         allow_unknown_entry: bool = False,
@@ -428,8 +430,10 @@ class _BaseArgMetadata:
         outright.  ``converter`` replaces the inferred ``type=`` converter (and makes any annotation
         type legal); ``preprocess`` runs before the inferred converter to transform the raw token while
         keeping the inferred choices/completer.  The two are mutually exclusive and neither combines with
-        a value-less action (see the module docstring).  ``extra_kwargs`` forwards any other
-        ``add_argument`` parameter (incl. those from
+        a value-less action (see the module docstring). ``sensitive=True`` marks a token or password
+        argument: the command still receives the value, but cmd2-managed history, script echo, and
+        argparse diagnostics redact it and the resulting history record can't be replayed. ``extra_kwargs``
+        forwards any other ``add_argument`` parameter (incl. those from
         [`register_argparse_argument_parameter`][cmd2.argparse_utils.register_argparse_argument_parameter]) straight through.
         """
         reserved = self._RESERVED_EXTRA_KWARGS & extra_kwargs.keys()
@@ -458,6 +462,7 @@ class _BaseArgMetadata:
         self.completer = completer
         self.table_columns = table_columns
         self.suppress_tab_hint = suppress_tab_hint
+        self.sensitive = sensitive
         self.const = const
         self.default = default
         self.allow_unknown_entry = allow_unknown_entry
@@ -1862,6 +1867,18 @@ _CONSTRAINTS: list[_Rule[_ArgparseArgument, Exception | None]] = [
             f"completer=/choices_provider= on '{a.name}' cannot be used with action={a._effective_action!r}, "
             f"which takes no value from the command line, so there is nothing to tab-complete. Remove the "
             f"completer/choices_provider, or use a value-consuming action."
+        ),
+    ),
+    (
+        # sensitive= redacts command-line values, but a value-less action contributes no value.
+        # Raw cmd2 raises too; the message here names the annotated parameter. Class actions exempt.
+        lambda a: (
+            a.metadata is not None and a.metadata.sensitive is True and a._policy is not None and a._policy.drop_converter
+        ),
+        lambda a: TypeError(
+            f"sensitive=True on '{a.name}' cannot be used with action={a._effective_action!r}, "
+            "which takes no value from the command line, so there is nothing to redact. Remove "
+            "sensitive, or use a value-consuming action."
         ),
     ),
     (

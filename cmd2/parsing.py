@@ -150,6 +150,11 @@ class Statement(str):  # noqa: SLOT000
     # Quotes are preserved.
     redirect_to: str = ""
 
+    # True when one or more argument values in this statement were replaced with a
+    # redaction placeholder because the command's parser declared them sensitive.
+    # Such records must never be replayed as executable commands.
+    redacted: bool = False
+
     def __new__(cls, value: object, *_pos_args: Any, **_kw_args: Any) -> Self:
         """Create a new instance of Statement.
 

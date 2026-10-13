@@ -15,7 +15,7 @@ from typing import (
     overload,
 )
 
-from . import constants
+from . import constants, redaction
 from .argparse_utils import (
     ArgparseCommandSpec,
     ClassParamParserFactory,
@@ -344,7 +344,10 @@ def with_argparser(
 
             try:
                 parsing_results: tuple[argparse.Namespace] | tuple[argparse.Namespace, list[str]]
-                with arg_parser.output_to(cmd_app.stdout):
+                # Scrub values of sensitive arguments from usage/error output so that a bad
+                # token (e.g. an invalid type) cannot leak through argparse diagnostics.
+                redaction_values = redaction.sensitive_values(arg_parser, statement.arg_list)
+                with arg_parser.output_to(cmd_app.stdout), arg_parser.redacting_sensitive_values(redaction_values):
                     if with_unknown_args:
                         parsing_results = arg_parser.parse_known_args(command_arg_list, initial_namespace)  # ty: ignore[invalid-assignment]
                     else:

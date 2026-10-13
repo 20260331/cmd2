@@ -167,6 +167,12 @@ text file:
 
     (Cmd) history :5 -o history.txt
 
+Commands whose arguments were declared sensitive (see
+[Sensitive Arguments](./argument_processing.md#sensitive-arguments)) are stored with the secret
+values replaced by `****`. Such records cannot be replayed: `--run` skips them with a warning, and
+`--output-file`/`--edit` write them as comments so a saved script ignores them instead of executing
+the placeholders.
+
 The last action the history command can perform is to clear the command history using `-c` or
 `--clear`:
 

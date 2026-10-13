@@ -328,6 +328,53 @@ def do_dir(self, args, unknown):
     ...
 ```
 
+## Sensitive Arguments
+
+Command-line tokens, passwords, and API keys typed as argument values are visible in cmd2's command
+history, script echo, and diagnostics. `read_secret()` hides them while they are typed, but it
+cannot protect a value that is passed as a regular command-line argument. To cover that case, mark
+the argument with `sensitive=True`:
+
+```py
+login_parser = cmd2.Cmd2ArgumentParser()
+login_parser.add_argument("--token", sensitive=True, help="API token")
+login_parser.add_argument("password", sensitive=True, help="account password")
+
+
+@cmd2.with_argparser(login_parser)
+def do_login(self, args: argparse.Namespace) -> None:
+    # The command function always receives the original, unredacted values
+    self.api_login(args.token, args.password)
+```
+
+When a command runs, the command function receives the real values exactly as before, but everywhere
+cmd2 records the command line for later use the value is replaced with `****`:
+
+- in-memory history shown by the `history` command, including search and script output
+- the persistent history file
+- the prompt-toolkit up-arrow history and auto-suggestions
+- command echo while running text scripts or reading piped input
+- argparse usage and error messages (e.g. an invalid value reported for a sensitive argument)
+
+For example, after entering `login --token s3cr3t hunter2`, history displays
+`login --token **** ****`.
+
+!!! warning "Redacted records cannot be replayed"
+
+    A history item whose values were redacted only contains placeholders, so it can never be
+    safely executed again. `history -r` skips such items with a warning instead of running them,
+    and scripts written with `history -o` contain those lines commented out (and therefore
+    ignored by `run_script`).
+
+The `@with_annotated` decorator accepts the same flag on its metadata:
+
+```py
+def do_login(self, token: Annotated[str, cmd2.Option("--token", sensitive=True)]) -> None: ...
+```
+
+`sensitive` only applies to arguments that consume a value; using it on value-less actions such as
+`store_true`, `store_false`, `store_const`, or `count` raises `ValueError`.
+
 ## Using A Custom Namespace
 
 In some cases, it may be necessary to write custom `argparse` code that is dependent on your

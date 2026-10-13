@@ -88,7 +88,8 @@ hist_json = (
     '        "terminator": "",\n'
     '        "suffix": "",\n'
     '        "redirector": "",\n'
-    '        "redirect_to": ""\n'
+    '        "redirect_to": "",\n'
+    '        "redacted": false\n'
     "      }\n"
     "    },\n"
     "    {\n"
@@ -100,7 +101,8 @@ hist_json = (
     '        "terminator": "",\n'
     '        "suffix": "",\n'
     '        "redirector": "",\n'
-    '        "redirect_to": ""\n'
+    '        "redirect_to": "",\n'
+    '        "redacted": false\n'
     "      }\n"
     "    },\n"
     "    {\n"
@@ -112,7 +114,8 @@ hist_json = (
     '        "terminator": "",\n'
     '        "suffix": "",\n'
     '        "redirector": "",\n'
-    '        "redirect_to": ""\n'
+    '        "redirect_to": "",\n'
+    '        "redacted": false\n'
     "      }\n"
     "    },\n"
     "    {\n"
@@ -124,7 +127,8 @@ hist_json = (
     '        "terminator": "",\n'
     '        "suffix": "",\n'
     '        "redirector": "",\n'
-    '        "redirect_to": ""\n'
+    '        "redirect_to": "",\n'
+    '        "redacted": false\n'
     "      }\n"
     "    }\n"
     "  ]\n"

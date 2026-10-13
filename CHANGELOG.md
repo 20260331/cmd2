@@ -1,3 +1,14 @@
+## Unreleased
+
+- Enhancements
+    - Argparse arguments can now be declared sensitive with `add_argument(..., sensitive=True)`
+      (also supported by `@with_annotated`'s `Argument`/`Option` metadata). The command function
+      still receives the original value, but cmd2 substitutes a redaction placeholder in command
+      history (including the persistent history file), prompt-toolkit up-arrow history, command echo
+      while running scripts or reading piped input, and argparse error output. Redacted history
+      records are flagged as non-replayable: `history -r` skips them and `history -o` writes them
+      commented out so saved scripts can't execute the placeholders
+
 ## 4.2.4 (September 8, 2026)
 
 - Bug Fixes

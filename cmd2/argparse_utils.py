@@ -208,6 +208,22 @@ It defaults to 50, but can be changed. If the number of completion suggestions
 exceeds this number, then a completion table won't be displayed.
 
 
+**Sensitive Arguments**
+
+Passing ``sensitive=True`` marks an argument as holding a secret (e.g. a token or
+password) that should never appear in cmd2-managed diagnostics::
+
+    parser.add_argument("--token", sensitive=True)
+
+The command function still receives the original value, but cmd2 substitutes a
+redaction placeholder for the typed value in command history (including the
+persistent history file), prompt-toolkit up-arrow history, command echo while
+running scripts, and argparse error output. A redacted history record is flagged
+as non-replayable: ``history -r`` skips it and commands saved with ``history -o``
+have it commented out, so a placeholder can never be executed as the real value.
+``sensitive`` cannot be used on value-less actions like ``store_true``.
+
+
 **Custom Argument Parameters**
 
 ``argparse._ActionsContainer.add_argument`` has been patched to support several
@@ -441,6 +457,19 @@ def _validate_completion_callable(self: argparse.Action, value: Any) -> Any:
     return value
 
 
+def _validate_sensitive(self: argparse.Action, value: Any) -> bool:
+    """Validate the sensitive parameter of an argparse action.
+
+    Sensitive arguments hold user-provided secrets (e.g. tokens or passwords), so marking an
+    action which consumes no values (store_true/store_false/store_const/count) is pointless and
+    usually a mistake.
+    """
+    is_sensitive: bool = bool(value)
+    if is_sensitive and self.nargs == 0:
+        raise ValueError("'sensitive' can only be set on an argument that consumes one or more values")
+    return is_sensitive
+
+
 # Add new attributes to argparse.Action.
 # See _ActionsContainer_add_argument() for details on these attributes.
 register_argparse_argument_parameter("choices_provider", validator=_validate_completion_callable)
@@ -448,6 +477,7 @@ register_argparse_argument_parameter("completer", validator=_validate_completion
 register_argparse_argument_parameter("table_columns")
 register_argparse_argument_parameter("nargs_range")
 register_argparse_argument_parameter("suppress_tab_hint")
+register_argparse_argument_parameter("sensitive", validator=_validate_sensitive)
 
 
 ############################################################################################################
@@ -466,6 +496,7 @@ def _ActionsContainer_add_argument(  # noqa: N802
     completer: UnboundCompleter[CmdOrSetT] | None = None,
     suppress_tab_hint: bool = False,
     table_columns: Sequence[str | Column] | None = None,
+    sensitive: bool = False,
     **kwargs: Any,
 ) -> argparse.Action:
     """Patch _ActionsContainer.add_argument() to support cmd2-specific settings.
@@ -486,6 +517,10 @@ def _ActionsContainer_add_argument(  # noqa: N802
                               argument's help text is set to argparse.SUPPRESS, then tab hints will not display
                               regardless of the value passed for suppress_tab_hint. Defaults to False.
     :param table_columns: optional headers for when displaying a completion table. Defaults to None.
+    :param sensitive: mark this argument as sensitive (e.g. a token or password). The command still receives the
+                      original value, but cmd2-managed diagnostics (history, script echo, and argparse error
+                      output) substitute a redaction placeholder for the typed value. Redacted history records
+                      are flagged and cannot be replayed as executable commands. Defaults to False.
 
     # Args from original function
     :param kwargs: keyword-arguments recognized by argparse._ActionsContainer.add_argument
@@ -569,6 +604,7 @@ def _ActionsContainer_add_argument(  # noqa: N802
     new_arg.set_completer(completer)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     new_arg.set_suppress_tab_hint(suppress_tab_hint)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     new_arg.set_table_columns(table_columns)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    new_arg.set_sensitive(sensitive)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
 
     # Set other registered custom attributes
     for keyword, value in custom_attribs.items():
@@ -687,6 +723,12 @@ class _ParserThreadLocals(threading.local):
     # output_to() context manager.
     current_output_file: IO[str] | None = None
 
+    # Raw values of sensitive arguments currently being parsed. While non-empty, all
+    # argparse output (usage and error messages) is scrubbed of these values so that
+    # invalid input to a sensitive argument never appears in diagnostics.
+    # It is managed via the redacting_sensitive_values() context manager.
+    sensitive_values: tuple[str, ...] = ()
+
 
 class Cmd2ArgumentParser(argparse.ArgumentParser):
     """Custom ArgumentParser class that improves error and help output."""
@@ -709,6 +751,40 @@ class Cmd2ArgumentParser(argparse.ArgumentParser):
             yield
         finally:
             self._thread_locals.current_output_file = previous
+
+    @contextlib.contextmanager
+    def redacting_sensitive_values(self, values: Iterable[str]) -> Generator[None]:
+        """Context manager which scrubs sensitive argument values from argparse output.
+
+        While active, every value in *values* that appears in usage or error output is
+        replaced with :data:`cmd2.constants.SENSITIVE_ARG_PLACEHOLDER`. This prevents a
+        bad value given for a sensitive argument (e.g. an invalid type) from leaking
+        through argparse's error messages.
+
+        :param values: raw sensitive values to scrub from any emitted output
+        """
+        # Replace longer values first so that substrings of a longer value can't
+        # leave part of the secret behind.
+        redaction_values = tuple(sorted({value for value in values if value}, key=len, reverse=True))
+        previous = self._thread_locals.sensitive_values
+        merged = tuple(dict.fromkeys((*previous, *redaction_values)))
+        self._thread_locals.sensitive_values = merged
+        try:
+            yield
+        finally:
+            self._thread_locals.sensitive_values = previous
+
+    def _print_message(  # type: ignore[override]  # ty: ignore[invalid-method-override]
+        self,
+        message: str,
+        file: IO[str] | None = None,
+    ) -> None:
+        """Override to scrub sensitive argument values from usage and error output."""
+        if message:
+            for secret in self._thread_locals.sensitive_values:
+                if secret:
+                    message = message.replace(secret, constants.SENSITIVE_ARG_PLACEHOLDER)
+        super()._print_message(message, file)
 
     def __init__(
         self,

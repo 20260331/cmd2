@@ -17,6 +17,10 @@ MULTILINE_TERMINATOR = ";"
 
 LINE_FEED = "\n"
 
+# Substituted for the value of argparse arguments declared sensitive in cmd2-managed
+# diagnostics (history, script echo, and argparse error output).
+SENSITIVE_ARG_PLACEHOLDER = "****"
+
 DEFAULT_SHORTCUTS = {"?": "help", "!": "shell", "@": "run_script", "@@": "_relative_run_script"}
 
 # Used as the command name placeholder in disabled command messages.
