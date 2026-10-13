@@ -22,7 +22,10 @@ from .argparse_utils import (
     register_argparse_argument_parameter,
     set_default_argument_parser,
 )
-from .cmd2 import Cmd
+from .cmd2 import (
+    Cmd,
+    SettingsScope,
+)
 from .colors import Color
 from .command_set import CommandSet
 from .completion import (
@@ -84,6 +87,7 @@ __all__: list[str] = [  # noqa: RUF022
     "Cmd",
     "CommandResult",
     "CommandSet",
+    "SettingsScope",
     "Statement",
     # Colors
     "Color",

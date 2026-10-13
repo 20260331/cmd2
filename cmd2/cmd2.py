@@ -55,13 +55,17 @@ from dataclasses import (
     dataclass,
     field,
 )
-from types import FrameType
+from types import (
+    FrameType,
+    TracebackType,
+)
 from typing import (
     IO,
     TYPE_CHECKING,
     Any,
     ClassVar,
     NamedTuple,
+    Self,
     TextIO,
     TypeVar,
     cast,
@@ -337,6 +341,119 @@ class _ConsoleCache(threading.local):
 
     stdout: Cmd2BaseConsole | None = None
     stderr: Cmd2BaseConsole | None = None
+
+
+class SettingsScope:
+    """A context manager which temporarily overrides a Cmd application's settings.
+
+    Instances should be created with [Cmd.temporary_settings][cmd2.Cmd.temporary_settings].
+    While the ``with`` block is active, the supplied settings hold the temporary values. When
+    the block is exited - normally, via an exception, or via ``KeyboardInterrupt`` - every
+    setting is restored to the value it held when the block was entered. Scopes can be nested;
+    an inner scope restores the enclosing scope's values, not the application defaults.
+
+    The override values must already be in their final converted Python types (no string
+    conversion is performed). Assignment and restoration go through the setting's
+    [Settable][cmd2.Settable], so ``choices`` validation and the ``onchange_cb`` callback are
+    honored exactly as they are for the ``set`` command. All names and values are validated
+    before anything is changed, so an invalid override never leaves settings partially applied.
+
+    A scope is single-use; call [Cmd.temporary_settings][cmd2.Cmd.temporary_settings] to create
+    a new scope for every ``with`` block.
+    """
+
+    def __init__(self, cmd_app: "Cmd", overrides: Mapping[str, Any]) -> None:
+        """Initialize the scope.
+
+        :param cmd_app: the Cmd application whose settings are being overridden
+        :param overrides: mapping of setting names to their temporary (already converted) values
+        """
+        self._cmd_app = cmd_app
+        self._overrides: dict[str, Any] = dict(overrides)
+
+        # Tuples of (Settable, value saved on entry), populated by __enter__ in application order
+        self._saved: list[tuple[Settable, Any]] = []
+        self._active = False
+        self._consumed = False
+
+    def __enter__(self) -> Self:
+        """Apply the temporary settings, saving the current values for later restoration."""
+        if self._active:
+            raise RuntimeError("A SettingsScope cannot be entered again while it is already active")
+        if self._consumed:
+            raise RuntimeError("A SettingsScope cannot be reused; call Cmd.temporary_settings() again")
+
+        # Resolve every name and validate every value before changing anything. This keeps
+        # settings from being left partially overridden when one name or value is invalid.
+        plan: list[tuple[Settable, Any]] = []
+        for name, new_value in self._overrides.items():
+            try:
+                settable = self._cmd_app.settables[name]
+            except KeyError:
+                raise KeyError(f"{name} is not a settable parameter") from None
+
+            if settable.choices is not None and new_value not in settable.choices:
+                choices_str = ", ".join(map(repr, settable.choices))
+                raise ValueError(f"invalid choice for {name}: {new_value!r} (choose from {choices_str})")
+
+            plan.append((settable, new_value))
+
+        # Save each current value before applying its override. Assignment goes through
+        # Settable.assign_value() so onchange callbacks fire exactly like with the set command.
+        try:
+            for settable, new_value in plan:
+                self._saved.append((settable, settable.value))
+                settable.assign_value(new_value)
+        except BaseException:
+            # An onchange callback (or KeyboardInterrupt) raised mid-application. Roll back
+            # the settings which were already changed so the failed entry has no lasting effect.
+            self._restore_saved()
+            self._saved.clear()
+            raise
+
+        self._active = True
+        self._consumed = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Restore every overridden setting to the value saved when the scope was entered.
+
+        Restoration happens in reverse order and is protected against SIGINT. Every setting
+        is still restored if one restoration raises, and a restoration error never masks an
+        exception already propagating from the ``with`` block.
+        """
+        if not self._active:
+            return
+        self._active = False
+
+        restore_error = self._restore_saved()
+        if restore_error is not None and exc_type is None:
+            raise restore_error
+
+    def _restore_saved(self) -> Exception | None:
+        """Restore every saved setting in reverse application order.
+
+        Restoration runs under SIGINT protection so an interrupt can't leave settings
+        partially restored. Every setting is still restored if one assignment raises, and
+        the first encountered error is returned to the caller.
+        """
+        restore_error: Exception | None = None
+
+        with self._cmd_app.sigint_protection:
+            for settable, old_value in reversed(self._saved):
+                try:
+                    settable.assign_value(old_value)
+                except Exception as ex:  # noqa: BLE001
+                    # Keep restoring the remaining settings, then report the first failure
+                    if restore_error is None:
+                        restore_error = ex
+
+        return restore_error
 
 
 class Cmd:
@@ -1411,6 +1528,84 @@ class Cmd:
             del self._settables[name]
         except KeyError as exc:
             raise KeyError(name + " is not a settable parameter") from exc
+
+    def temporary_settings(
+        self,
+        overrides: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SettingsScope:
+        """Create a context manager which temporarily overrides settings.
+
+        The supplied settings hold their temporary values while the returned
+        [SettingsScope][cmd2.SettingsScope] is active and are restored to the values they
+        held on entry when the ``with`` block exits - even if an exception or
+        ``KeyboardInterrupt`` propagates out of it. Nested scopes restore the enclosing
+        scope's values rather than the application defaults.
+
+        Values must already be in their final converted Python types; no string conversion
+        is performed. Assignments honor the setting's ``choices`` and invoke its
+        ``onchange_cb`` just like the ``set`` command.
+
+        Example::
+
+            with app.temporary_settings(quiet=True):
+                app.onecmd_plus_hooks("help")
+
+        Settings whose names are not valid Python keyword arguments (e.g. prefixed
+        CommandSet settings containing a dot) can be passed via the ``overrides`` mapping::
+
+            with app.temporary_settings({"MyCommandSet.my_opt": "value"}):
+                ...
+
+        :param overrides: optional mapping of setting names to temporary values
+        :param kwargs: additional temporary settings, keyed by setting name
+        :raises KeyError: if a name does not match any settable parameter
+        :raises ValueError: if a temporary value is not one of the setting's choices
+        """
+        merged_overrides: dict[str, Any] = dict(overrides) if overrides is not None else {}
+        merged_overrides.update(kwargs)
+        return SettingsScope(self, merged_overrides)
+
+    def _parse_temp_settings(self, raw_settings: Sequence[str]) -> dict[str, Any] | None:
+        """Parse ``NAME=VALUE`` strings passed to run_script/run_pyscript into setting overrides.
+
+        Each value is run through its Settable's ``val_type`` callable and ``choices``
+        validation, exactly as the ``set`` command does. An error is printed and None is
+        returned if any string is malformed, names an unknown setting, or fails conversion.
+
+        :param raw_settings: raw ``NAME=VALUE`` strings from the command line
+        :return: mapping of setting name to converted temporary value, or None on error
+        """
+        overrides: dict[str, Any] = {}
+
+        for raw_setting in raw_settings:
+            name, separator, raw_value = raw_setting.partition("=")
+            name = name.strip()
+
+            if not separator or not name:
+                self.perror(f"Invalid setting override {raw_setting!r}; expected the format NAME=VALUE")
+                return None
+
+            try:
+                settable = self.settables[name]
+            except KeyError:
+                self.perror(f"Parameter '{name}' not supported (type 'set' for list of parameters).")
+                return None
+
+            try:
+                new_value = settable.val_type(raw_value)
+            except ValueError as ex:
+                self.perror(f"Error setting {name}: {ex}")
+                return None
+
+            if settable.choices is not None and new_value not in settable.choices:
+                choices_str = ", ".join(map(repr, settable.choices))
+                self.perror(f"Error setting {name}: invalid choice: {new_value!r} (choose from {choices_str})")
+                return None
+
+            overrides[name] = new_value
+
+        return overrides
 
     def build_settables(self) -> None:
         """Create the dictionary of user-settable parameters."""
@@ -5172,6 +5367,18 @@ class Cmd:
         run_pyscript_parser.add_argument(
             "script_arguments", nargs=argparse.REMAINDER, help="arguments to pass to script", completer=cls.path_complete
         )
+        run_pyscript_parser.add_argument(
+            "-s",
+            "--set",
+            dest="temp_settings",
+            action="append",
+            default=[],
+            metavar="NAME=VALUE",
+            help=(
+                "temporarily override a setting for the duration of this script (may be repeated); "
+                "the prior value is restored when the script ends, even if it raises or is interrupted"
+            ),
+        )
 
         return run_pyscript_parser
 
@@ -5185,6 +5392,11 @@ class Cmd:
 
         # Expand ~ before placing this path in sys.argv just as a shell would
         args.script_path = os.path.expanduser(args.script_path)
+
+        # Convert any temporary setting overrides before doing anything else
+        temp_settings = self._parse_temp_settings(args.temp_settings)
+        if temp_settings is None:
+            return None
 
         # Add some protection against accidentally running a non-Python file. The happens when users
         # mix up run_script and run_pyscript.
@@ -5201,8 +5413,12 @@ class Cmd:
             # Overwrite sys.argv to allow the script to take command line arguments
             sys.argv = [args.script_path, *args.script_arguments]
 
-            # self.last_result will be set by _run_python()
-            py_return = self._run_python(pyscript=args.script_path)
+            # Hold the temporary settings only while the script runs. The scope restores the
+            # prior values no matter how the script ends, including nested scripts, exceptions,
+            # and Ctrl-C.
+            with self.temporary_settings(temp_settings):
+                # self.last_result will be set by _run_python()
+                py_return = self._run_python(pyscript=args.script_path)
         finally:
             # Restore command line arguments to original state
             sys.argv = orig_args
@@ -5605,6 +5821,18 @@ class Cmd:
             help="path to the script file",
             completer=cls.path_complete,
         )
+        run_script_parser.add_argument(
+            "-s",
+            "--set",
+            dest="temp_settings",
+            action="append",
+            default=[],
+            metavar="NAME=VALUE",
+            help=(
+                "temporarily override a setting for the duration of this script (may be repeated); "
+                "the prior value is restored when the script ends, even if it raises or is interrupted"
+            ),
+        )
 
         return run_script_parser
 
@@ -5620,6 +5848,11 @@ class Cmd:
         """
         self.last_result = False
         expanded_path = os.path.abspath(os.path.expanduser(args.script_path))
+
+        # Convert any temporary setting overrides before touching the script file
+        temp_settings = self._parse_temp_settings(args.temp_settings)
+        if temp_settings is None:
+            return None
 
         # Add some protection against accidentally running a Python file. The happens when users
         # mix up run_script and run_pyscript.
@@ -5651,11 +5884,15 @@ class Cmd:
 
         try:
             self._script_dir.append(os.path.dirname(expanded_path))
-            stop = self.runcmds_plus_hooks(
-                script_commands,
-                add_to_history=self.scripts_add_to_history,
-                stop_on_keyboard_interrupt=True,
-            )
+            # Hold the temporary settings only while the script's commands run. The scope
+            # restores the prior values no matter how the script ends, including nested
+            # scripts, exceptions, and Ctrl-C.
+            with self.temporary_settings(temp_settings):
+                stop = self.runcmds_plus_hooks(
+                    script_commands,
+                    add_to_history=self.scripts_add_to_history,
+                    stop_on_keyboard_interrupt=True,
+                )
             self.last_result = True
             return stop
         finally:

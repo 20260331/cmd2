@@ -31,6 +31,10 @@ There is a variant [\_relative_run_script](./builtin_commands.md#_relative_run_s
 `@@` shortcut (if using the default shortcuts) for use within a script which uses paths relative to
 the first script.
 
+Command scripts can temporarily override settings with repeatable `-s`/`--set NAME=VALUE` options;
+the previous values are restored when the script ends, even if the script raises, is interrupted, or
+runs nested scripts. See [Temporary Settings](./settings.md#temporary-settings).
+
 ### Comments
 
 A command line is a comment if the first non-whitespace character is a `#`. This means any `#`
@@ -58,6 +62,12 @@ pyscript:
 
 [run_pyscript](./builtin_commands.md#run_pyscript) supports tab completion of file system paths, and
 as shown above it has the ability to pass command-line arguments to the scripts invoked.
+
+Python scripts can also temporarily override settings with repeatable `-s`/`--set NAME=VALUE`
+options (placed before the script path). The previous values are restored when the script ends, even
+if it raises or is interrupted. From within the script itself, `app.temporary_settings(...)`
+provides the same capability as a context manager. See
+[Temporary Settings](./settings.md#temporary-settings).
 
 ## Developing a cmd2 API
 

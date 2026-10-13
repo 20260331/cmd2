@@ -1,3 +1,17 @@
+## Unreleased
+
+- Enhancements
+    - Added `Cmd.temporary_settings()` and the `SettingsScope` context manager for temporarily
+      overriding settings (including CommandSet settings) from Python. The prior values are restored
+      on scope exit even when exceptions or `KeyboardInterrupt` propagate, and nested scopes restore
+      the enclosing scope's values. Existing type conversion, `choices` validation, and
+      `onchange_cb` behavior is preserved.
+    - Added repeatable `-s`/`--set NAME=VALUE` options to `run_script` and `run_pyscript` to
+      override settings for the duration of a script and restore the previous values when it ends,
+      including around nested scripts, exceptions, and interruptions.
+    - Added a `temporary_settings()` method to the Python `app` bridge available in pyscripts and
+      the embedded Python shell.
+
 ## 4.2.4 (September 8, 2026)
 
 - Bug Fixes

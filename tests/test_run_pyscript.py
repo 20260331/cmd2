@@ -122,7 +122,62 @@ def test_run_pyscript_dir(base_app, request) -> None:
     python_script = os.path.join(test_dir, "pyscript", "pyscript_dir.py")
 
     out, _err = run_cmd(base_app, f"run_pyscript {python_script}")
-    assert out[0] == "['cmd_echo']"
+    assert out[0] == "['cmd_echo', 'temporary_settings']"
+
+
+def test_run_pyscript_temp_settings(base_app, request) -> None:
+    test_dir = os.path.dirname(request.module.__file__)
+    python_script = os.path.join(test_dir, "pyscript", "temp_settings.py")
+
+    assert base_app.quiet is False
+    assert base_app.echo is False
+
+    out, err = run_cmd(base_app, f"run_pyscript --set quiet=true {python_script}")
+    assert not err
+    # quiet came from run_pyscript; echo was set by the bridge scope inside the script
+    assert out == ["True", "True", "False"]
+
+    # Everything is restored once the script ends
+    assert base_app.quiet is False
+    assert base_app.echo is False
+
+
+def test_run_pyscript_temp_settings_short_option(base_app, request) -> None:
+    test_dir = os.path.dirname(request.module.__file__)
+    python_script = os.path.join(test_dir, "pyscript", "temp_settings.py")
+
+    out, _err = run_cmd(base_app, f"run_pyscript -s quiet=true {python_script}")
+    assert out[0] == "True"
+    assert base_app.quiet is False
+
+
+def test_run_pyscript_temp_settings_restore_on_exception(base_app, request) -> None:
+    test_dir = os.path.dirname(request.module.__file__)
+    python_script = os.path.join(test_dir, "pyscript", "raises_exception.py")
+
+    _out, err = run_cmd(base_app, f"run_pyscript --set quiet=true {python_script}")
+    assert err[0].startswith("Traceback")
+    # The exception in the script does not leak the temporary setting into the session
+    assert base_app.quiet is False
+
+
+def test_run_pyscript_temp_settings_bad_value(base_app, request) -> None:
+    test_dir = os.path.dirname(request.module.__file__)
+    python_script = os.path.join(test_dir, "script.py")
+
+    _out, err = run_cmd(base_app, f"run_pyscript --set quiet=maybe {python_script}")
+    assert "Error setting quiet" in err[0]
+    assert base_app.last_result is False
+    assert base_app.quiet is False
+
+
+def test_run_pyscript_temp_settings_unknown_name(base_app, request) -> None:
+    test_dir = os.path.dirname(request.module.__file__)
+    python_script = os.path.join(test_dir, "script.py")
+
+    _out, err = run_cmd(base_app, f"run_pyscript --set bogus=1 {python_script}")
+    assert "Parameter 'bogus' not supported" in err[0]
+    assert base_app.last_result is False
 
 
 def test_py_bridge_capture_isolation() -> None:

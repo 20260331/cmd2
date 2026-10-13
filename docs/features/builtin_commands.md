@@ -58,10 +58,18 @@ This command exits the `cmd2` application.
 This command runs a Python script file inside the `cmd2` application. See
 [Python Scripts](./scripting.md#python-scripts) for more information.
 
+The repeatable `-s`/`--set NAME=VALUE` option temporarily overrides a setting while the script runs;
+the prior value is restored afterwards. See [Temporary Settings](./settings.md#temporary-settings)
+for details.
+
 ### run_script
 
 This command runs commands in a script file that is encoded as either ASCII or UTF-8 text. See
 [Command Scripts](./scripting.md#command-scripts) for more information.
+
+The repeatable `-s`/`--set NAME=VALUE` option temporarily overrides a setting while the script runs;
+the prior value is restored afterwards (also around nested scripts, exceptions, and Ctrl-C). See
+[Temporary Settings](./settings.md#temporary-settings) for details.
 
 ### \_relative_run_script
 

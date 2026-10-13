@@ -122,6 +122,66 @@ now: 13
 It's 13 C - are you a penguin?
 ```
 
+## Temporary Settings
+
+Running a script or a block of Python code often requires changing a setting for just that
+operation. Using `set` for this permanently affects the interactive session. Instead, settings can
+be overridden temporarily and automatically restored to the value they held before the change.
+
+### Python Setting Scopes
+
+[Cmd.temporary_settings][cmd2.Cmd.temporary_settings] returns a context manager which applies the
+overrides on entry and restores the previous values on exit - even if an exception or
+`KeyboardInterrupt` propagates out of the `with` block. Values are supplied as their final converted
+Python types (no string conversion is performed):
+
+```py
+with app.temporary_settings(quiet=True):
+    app.onecmd_plus_hooks("help")
+# app.quiet is back to the value it had before the with block
+```
+
+A mapping can be used instead of keyword arguments, which is required for prefixed
+[CommandSet](./modular_commands.md) setting names that contain a dot:
+
+```py
+with app.temporary_settings({"MyCommandSet.my_option": 42}):
+    ...
+```
+
+Scopes can be nested. When an inner scope exits, it restores the values of the enclosing scope
+rather than the application defaults. If a setting is changed while a scope is active (even via the
+`set` command), exiting the scope still restores the value that was saved on entry.
+
+Assignments go through the same [Settable][cmd2.Settable] mechanism as the `set` command, so
+`choices` are validated and `onchange_cb` callbacks run both when a temporary value is applied and
+when it is restored. Override names and values are validated before anything is changed, so an
+invalid override never leaves settings partially applied.
+
+Inside a [Python script](./scripting.md#python-scripts), the same context manager is available on
+the `app` bridge object:
+
+```py
+with app.temporary_settings(quiet=True):
+    app("help")
+```
+
+### Temporary Settings in Script Commands
+
+Both [run_script](./builtin_commands.md#run_script) and
+[run_pyscript](./builtin_commands.md#run_pyscript) accept repeatable `-s`/`--set NAME=VALUE`
+options. The values use the same conversion and validation as `set NAME VALUE`, and they are
+restored automatically when the script ends - including when the script raises, is interrupted with
+Ctrl-C, or runs other scripts that set their own temporary values:
+
+```text
+(Cmd) run_script --set quiet=true --set echo=false my_script.txt
+(Cmd) run_pyscript --set allow_style=never my_script.py arg1
+```
+
+For `run_pyscript`, place the `--set` options before the script path; anything after the path is
+passed to the script unchanged as its command-line arguments.
+
 ## Hide Builtin Settings
 
 You may want to prevent a user from modifying a built-in setting. Let's say that you never want end

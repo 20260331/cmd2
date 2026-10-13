@@ -162,7 +162,13 @@ class Settable:
     def value(self, value: Any) -> None:
         """Set the settable attribute on the specified destination object.
 
+        The value is run through this Settable's ``val_type`` callable to handle conversion
+        and validation, and then checked against ``choices`` (if defined). Use
+        [assign_value][cmd2.utils.Settable.assign_value] to assign a value that has
+        already been converted and validated.
+
         :param value: new value to set
+        :raises ValueError: if the value fails conversion/validation or is not a valid choice
         """
         # Run the value through its type function to handle any conversion or validation
         new_value = self.val_type(value)
@@ -172,7 +178,19 @@ class Settable:
             choices_str = ", ".join(map(repr, self.choices))
             raise ValueError(f"invalid choice: {new_value!r} (choose from {choices_str})")
 
-        # Try to update the settable's value
+        self.assign_value(new_value)
+
+    def assign_value(self, new_value: Any) -> None:
+        """Assign an already converted and validated value to the settable attribute.
+
+        Unlike the ``value`` setter, this does not run the value through ``val_type`` or
+        check ``choices``. This is used to restore a previously observed value (e.g. when
+        exiting a temporary setting scope) without assuming the type callable accepts the
+        converted value. The ``onchange_cb`` callback is still invoked if the value changed.
+
+        :param new_value: the new value, already in its final converted type
+        """
+        # Save the current value, update the attribute, then fire the onchange callback as needed
         orig_value = self.value
         setattr(self.settable_obj, self.settable_attrib_name, new_value)
 

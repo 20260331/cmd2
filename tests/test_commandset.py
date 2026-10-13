@@ -1206,3 +1206,41 @@ def test_ns_provider() -> None:
     app.unregister_command_set(ns_provider_set)
     run_cmd(app, "test_ns")
     assert app.last_result == app
+
+
+def test_temporary_settings_commandset() -> None:
+    """A setting owned by a CommandSet can be overridden by a temporary settings scope."""
+
+    class Arbitrary:
+        def __init__(self) -> None:
+            self.some_value = 5
+
+    class WithSettables(CommandSetBase):
+        def __init__(self) -> None:
+            super().__init__()
+            self._arbitrary = Arbitrary()
+            self._settable_prefix = "addon"
+            self.add_settable(
+                Settable(
+                    "arbitrary_value",
+                    int,
+                    "Some settable value",
+                    settable_object=self._arbitrary,
+                    settable_attrib_name="some_value",
+                )
+            )
+
+    cmdset = WithSettables()
+    app = cmd2.Cmd(command_sets=[cmdset], auto_load_commands=False)
+
+    # Without forced prefixes the CommandSet setting uses its bare name
+    assert app.settables["arbitrary_value"].value == 5
+    with app.temporary_settings(arbitrary_value=10):
+        assert cmdset._arbitrary.some_value == 10
+    assert cmdset._arbitrary.some_value == 5
+
+    # With forced prefixes the dotted name must work through the mapping
+    app.always_prefix_settables = True
+    with app.temporary_settings({"addon.arbitrary_value": 10}):
+        assert cmdset._arbitrary.some_value == 10
+    assert cmdset._arbitrary.some_value == 5

@@ -4,6 +4,7 @@ Maintains a reasonable degree of isolation between the two.
 """
 
 import sys
+from collections.abc import Mapping
 from contextlib import redirect_stderr
 from typing import (
     IO,
@@ -17,7 +18,7 @@ from typing import (
 from .utils import StdSim  # namedtuple_with_defaults,
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .cmd2 import Cmd
+    from .cmd2 import Cmd, SettingsScope
 
 
 class CommandResult(NamedTuple):
@@ -92,7 +93,32 @@ class PyBridge:
         """Return a custom set of attribute names."""
         attributes: list[str] = []
         attributes.insert(0, "cmd_echo")
+        attributes.insert(0, "temporary_settings")
         return attributes
+
+    def temporary_settings(
+        self,
+        overrides: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> "SettingsScope":
+        """Provide a context manager which temporarily overrides application settings.
+
+        This delegates to [Cmd.temporary_settings][cmd2.Cmd.temporary_settings], so pyscripts
+        can change settings for a block of commands without permanently affecting the
+        interactive session. Settings are restored when the block exits, even if an exception
+        occurs, and nested scopes restore the enclosing scope's values. Values must already be
+        in their final converted Python types.
+
+        Example::
+
+            with app.temporary_settings(quiet=True):
+                app("help")
+
+        :param overrides: optional mapping of setting names to temporary values
+        :param kwargs: additional temporary settings, keyed by setting name
+        :return: a context manager that applies and later restores the temporary settings
+        """
+        return self._cmd_app.temporary_settings(overrides, **kwargs)
 
     def __call__(self, command: str, *, echo: bool | None = None) -> CommandResult:
         """Provide functionality to call application commands by calling PyBridge.

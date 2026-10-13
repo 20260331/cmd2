@@ -402,6 +402,276 @@ def test_set_onchange_hook(onchange_app) -> None:
     assert onchange_app.last_result is True
 
 
+class TempSettingsApp(cmd2.Cmd):
+    """App used to test temporary setting scopes."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.myint = 5
+        self.letter = "a"
+        self.change_log: list[tuple[str, int, int]] = []
+        self.add_settable(utils.Settable("myint", int, "integer setting", self, onchange_cb=self._onchange_myint))
+        self.add_settable(utils.Settable("letter", str, "choice setting", self, choices=["a", "b", "c"]))
+
+    def _onchange_myint(self, name: str, old: int, new: int) -> None:
+        self.change_log.append((name, old, new))
+
+    def do_showmyint(self, _args: object) -> None:
+        """Print the current value of myint."""
+        self.poutput(f"myint={self.myint}")
+
+    def do_interrupt(self, _args: object) -> None:
+        """Raise KeyboardInterrupt to simulate Ctrl-C."""
+        raise KeyboardInterrupt
+
+
+@pytest.fixture
+def temp_settings_app():
+    return TempSettingsApp()
+
+
+def test_temporary_settings_applies_and_restores(temp_settings_app) -> None:
+    assert temp_settings_app.myint == 5
+    assert temp_settings_app.quiet is False
+
+    with temp_settings_app.temporary_settings(myint=9, quiet=True):
+        assert temp_settings_app.myint == 9
+        assert temp_settings_app.quiet is True
+
+    assert temp_settings_app.myint == 5
+    assert temp_settings_app.quiet is False
+
+
+def test_temporary_settings_accepts_mapping(temp_settings_app) -> None:
+    with temp_settings_app.temporary_settings({"myint": 9}):
+        assert temp_settings_app.myint == 9
+    assert temp_settings_app.myint == 5
+
+
+def test_temporary_settings_onchange_fires_on_apply_and_restore(temp_settings_app) -> None:
+    # No callback when the temporary value matches the current one
+    with temp_settings_app.temporary_settings(myint=5):
+        pass
+    assert temp_settings_app.change_log == []
+
+    # Callbacks fire on apply and on restore with the correct old/new values
+    with temp_settings_app.temporary_settings(myint=9):
+        assert temp_settings_app.change_log == [("myint", 5, 9)]
+    assert temp_settings_app.change_log == [("myint", 5, 9), ("myint", 9, 5)]
+
+
+def test_temporary_settings_restores_on_exception(temp_settings_app) -> None:
+    def raise_in_scope() -> None:
+        with temp_settings_app.temporary_settings(myint=9):
+            assert temp_settings_app.myint == 9
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        raise_in_scope()
+    assert temp_settings_app.myint == 5
+
+
+def test_temporary_settings_restores_on_keyboard_interrupt(temp_settings_app) -> None:
+    with pytest.raises(KeyboardInterrupt), temp_settings_app.temporary_settings(myint=9):
+        raise KeyboardInterrupt
+    assert temp_settings_app.myint == 5
+
+
+def test_temporary_settings_nested_scopes(temp_settings_app) -> None:
+    with temp_settings_app.temporary_settings(myint=1):
+        assert temp_settings_app.myint == 1
+        with temp_settings_app.temporary_settings(myint=2):
+            assert temp_settings_app.myint == 2
+        # Inner scope restores the enclosing scope's value, not the default
+        assert temp_settings_app.myint == 1
+    assert temp_settings_app.myint == 5
+
+
+def test_temporary_settings_restores_after_mutation_inside(temp_settings_app) -> None:
+    # A permanent-looking change made inside the scope is still rolled back on exit
+    with temp_settings_app.temporary_settings(myint=1):
+        temp_settings_app.myint = 42
+        assert temp_settings_app.myint == 42
+    assert temp_settings_app.myint == 5
+
+
+def test_temporary_settings_unknown_name_changes_nothing(temp_settings_app) -> None:
+    with pytest.raises(KeyError, match="bogus"), temp_settings_app.temporary_settings(myint=9, bogus=1):
+        pytest.fail("scope should not be entered")
+    assert temp_settings_app.myint == 5
+    assert temp_settings_app.change_log == []
+
+
+def test_temporary_settings_invalid_choice_changes_nothing(temp_settings_app) -> None:
+    # myint is valid and comes first, yet nothing may change when the later value is invalid
+    with pytest.raises(ValueError, match="invalid choice"), temp_settings_app.temporary_settings(myint=9, letter="z"):
+        pytest.fail("scope should not be entered")
+    assert temp_settings_app.letter == "a"
+    assert temp_settings_app.myint == 5
+    assert temp_settings_app.change_log == []
+
+
+def test_temporary_settings_scope_is_one_shot(temp_settings_app) -> None:
+    scope = temp_settings_app.temporary_settings(myint=9)
+    with scope:
+        assert temp_settings_app.myint == 9
+    assert temp_settings_app.myint == 5
+    with pytest.raises(RuntimeError), scope:
+        pass
+
+
+def test_temporary_settings_restore_error_is_raised_when_body_succeeds() -> None:
+    class RestoreErrorApp(cmd2.Cmd):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.flag = False
+            self.add_settable(utils.Settable("flag", bool, "flag setting", self, onchange_cb=self._onchange))
+
+        def _onchange(self, _name: str, old: bool, new: bool) -> None:
+            # Fail only while restoring True -> False
+            if old and not new:
+                raise RuntimeError("restore failed")
+
+    app = RestoreErrorApp()
+    with pytest.raises(RuntimeError, match="restore failed"), app.temporary_settings(flag=True):
+        assert app.flag is True
+    # The assignment itself still happened before the failing onchange callback
+    assert app.flag is False
+
+
+def test_temporary_settings_restore_error_never_masks_body_exception() -> None:
+    class RestoreErrorApp(cmd2.Cmd):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.flag = False
+            self.add_settable(utils.Settable("flag", bool, "flag setting", self, onchange_cb=self._onchange))
+
+        def _onchange(self, _name: str, old: bool, new: bool) -> None:
+            if old and not new:
+                raise RuntimeError("restore failed")
+
+    app = RestoreErrorApp()
+
+    def raise_in_scope() -> None:
+        with app.temporary_settings(flag=True):
+            raise ValueError("body failure")
+
+    # The body's exception propagates even though restoration also failed
+    with pytest.raises(ValueError, match="body failure"):
+        raise_in_scope()
+
+
+def test_temporary_settings_rolls_back_when_onchange_raises() -> None:
+    class OnChangeRaisesApp(cmd2.Cmd):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.first = 1
+            self.second = 2
+            self.add_settable(utils.Settable("first", int, "first setting", self))
+            self.add_settable(utils.Settable("second", int, "second setting", self, onchange_cb=self._raise))
+
+        @staticmethod
+        def _raise(_name: str, _old: int, _new: int) -> None:
+            raise RuntimeError("onchange failed")
+
+    app = OnChangeRaisesApp()
+    with pytest.raises(RuntimeError, match="onchange failed"), app.temporary_settings(first=10, second=20):
+        pytest.fail("scope should not be entered")
+    # The setting applied before the failure must have been rolled back
+    assert app.first == 1
+    assert app.second == 2
+
+
+def test_run_script_temp_settings(temp_settings_app, tmp_path) -> None:
+    script_file = tmp_path / "show.txt"
+    script_file.write_text("showmyint\n", encoding="utf-8")
+
+    out, err = run_cmd(temp_settings_app, f"run_script --set myint=9 {script_file}")
+    assert not err
+    assert "myint=9" in out
+    assert temp_settings_app.last_result is True
+
+    # The setting only lasted for the duration of the script
+    assert temp_settings_app.myint == 5
+    assert temp_settings_app.change_log == [("myint", 5, 9), ("myint", 9, 5)]
+
+
+def test_run_script_temp_settings_short_option(temp_settings_app, tmp_path) -> None:
+    script_file = tmp_path / "show.txt"
+    script_file.write_text("showmyint\n", encoding="utf-8")
+
+    out, _err = run_cmd(temp_settings_app, f"run_script -s myint=9 {script_file}")
+    assert "myint=9" in out
+    assert temp_settings_app.myint == 5
+
+
+def test_run_script_temp_settings_nested(temp_settings_app, tmp_path) -> None:
+    inner_file = tmp_path / "inner.txt"
+    inner_file.write_text("showmyint\n", encoding="utf-8")
+
+    outer_file = tmp_path / "outer.txt"
+    outer_file.write_text(
+        f"run_script --set myint=8 {su.quote(str(inner_file))}\nshowmyint\n",
+        encoding="utf-8",
+    )
+
+    out, err = run_cmd(temp_settings_app, f"run_script --set myint=9 {outer_file}")
+    assert not err
+    assert out == ["myint=8", "myint=9"]
+
+    # The nested script restored the outer script's value, then the outer restored the default
+    assert temp_settings_app.myint == 5
+
+
+def test_run_script_temp_settings_restore_on_interrupt(temp_settings_app, tmp_path) -> None:
+    # Ctrl-C stops the script; the remaining commands must not run and settings must restore
+    script_file = tmp_path / "interrupt.txt"
+    script_file.write_text("interrupt\nshowmyint\n", encoding="utf-8")
+
+    out, _err = run_cmd(temp_settings_app, f"run_script --set myint=9 {script_file}")
+    assert "myint=9" not in out
+    assert temp_settings_app.myint == 5
+    assert temp_settings_app.change_log == [("myint", 5, 9), ("myint", 9, 5)]
+
+
+def test_run_script_temp_settings_bad_value(temp_settings_app, tmp_path) -> None:
+    script_file = tmp_path / "show.txt"
+    script_file.write_text("showmyint\n", encoding="utf-8")
+
+    _out, err = run_cmd(temp_settings_app, f"run_script --set myint=not_an_int {script_file}")
+    assert "Error setting myint" in err[0]
+    assert temp_settings_app.last_result is False
+    # The script never ran and the setting was not changed
+    assert temp_settings_app.myint == 5
+
+
+def test_run_script_temp_settings_malformed(temp_settings_app, tmp_path) -> None:
+    script_file = tmp_path / "show.txt"
+    script_file.write_text("showmyint\n", encoding="utf-8")
+
+    _out, err = run_cmd(temp_settings_app, f"run_script --set myint {script_file}")
+    assert "expected the format NAME=VALUE" in err[0]
+    assert temp_settings_app.myint == 5
+
+
+def test_run_script_temp_settings_unknown_name(temp_settings_app, tmp_path) -> None:
+    script_file = tmp_path / "show.txt"
+    script_file.write_text("showmyint\n", encoding="utf-8")
+
+    _out, err = run_cmd(temp_settings_app, f"run_script --set bogus=1 {script_file}")
+    assert "Parameter 'bogus' not supported" in err[0]
+    assert temp_settings_app.last_result is False
+
+
+def test_run_script_temp_settings_invalid_choice(temp_settings_app, tmp_path) -> None:
+    script_file = tmp_path / "show.txt"
+    script_file.write_text("showmyint\n", encoding="utf-8")
+
+    _out, err = run_cmd(temp_settings_app, f"run_script --set letter=z {script_file}")
+    assert "Error setting letter" in err[0]
+    assert temp_settings_app.letter == "a"
+
+
 def test_base_shell(base_app, monkeypatch) -> None:
     m = mock.Mock()
     monkeypatch.setattr("{}.Popen".format("subprocess"), m)
